@@ -149,8 +149,13 @@ def _numpy_cell_to_python(value: object) -> ColumnValue:
     raise InternalError(f"el ejecutor produjo un valor no representable: {value!r}")
 
 
-def _batch_to_rows(batch: RowBatch) -> list[tuple[ColumnValue, ...]]:
-    names = batch.schema.columns
+def _batch_to_rows(
+    batch: RowBatch, *, exclude: frozenset[str] = frozenset()
+) -> list[tuple[ColumnValue, ...]]:
+    """Materializa un `RowBatch` como tuplas Python. `exclude` recorta las
+    columnas internas (claves de ORDER BY ocultas, `__rowid__`) que el plan
+    necesitó pero el usuario no proyectó."""
+    names = [name for name in batch.schema.columns if name not in exclude]
     if not names:
         return []
     columns: list[list[ColumnValue]] = []
@@ -542,13 +547,15 @@ class DatabaseEngine:
         tables = [stmt.from_table.name] + [join.table.name for join in stmt.joins]
         for table in tables:
             self._catalog.table(table)  # existencia; error tipado si falta
-        opt_select = select_to_optimizer(stmt)
-        batch = self._run_select_plan(txn_id, opt_select, tables, include_rowid=False)
-        rows = _batch_to_rows(batch)
-        types = tuple(batch.schema.type_of(name).name for name in batch.schema.columns)
+        translated = select_to_optimizer(stmt)
+        batch = self._run_select_plan(txn_id, translated.statement, tables, include_rowid=False)
+        hidden = frozenset(translated.hidden_columns)
+        rows = _batch_to_rows(batch, exclude=hidden)
+        visible = [name for name in batch.schema.columns if name not in hidden]
+        types = tuple(batch.schema.type_of(name).name for name in visible)
         return StatementResult(
             kind="select",
-            columns=tuple(batch.schema.columns),
+            columns=tuple(visible),
             column_types=types,
             rows=rows,
             rowcount=len(rows),

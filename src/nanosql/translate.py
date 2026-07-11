@@ -18,6 +18,8 @@ módulos, verificado aquí en el arranque del import, no confiado a fe ciega).
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import cost_based_query_optimizer.models as om
 import cost_based_query_optimizer.plan as oplan
 import sql_query_parser.models as pm
@@ -135,20 +137,35 @@ def _select_item_output_name(item: pm.SelectItem) -> str:
     )
 
 
-def _normalize_order_by(stmt: pm.SelectStatement) -> tuple[om.OrderByItem, ...]:
+@dataclass(frozen=True, slots=True)
+class TranslatedSelect:
+    """`SELECT` ya traducido al AST del optimizador, más los nombres de las
+    columnas ocultas que la traducción añadió a la proyección (claves de
+    `ORDER BY` no proyectadas por el usuario): el engine debe recortarlas
+    del resultado final antes de devolver filas."""
+
+    statement: om.SelectStatement
+    hidden_columns: tuple[str, ...] = ()
+
+
+def _normalize_order_by(
+    stmt: pm.SelectStatement,
+) -> tuple[tuple[om.OrderByItem, ...], tuple[om.SelectItem, ...], tuple[str, ...]]:
     """Reescribe cada clave de `ORDER BY` como referencia a una columna de
-    SALIDA del `SELECT`.
+    SALIDA del `SELECT`, y devuelve `(order_by, items_extra, nombres_ocultos)`.
 
     Contrato heredado del ecosistema: el optimizador coloca el `Sort` por
     encima del `Project` (semántica SQL: se ordena el resultado), así que en
     ejecución las claves de ordenación se resuelven contra el esquema YA
-    proyectado — donde `u.name AS n` se llama `n`, no `u.name`. Ordenar por
-    una expresión que no forma parte de la lista del SELECT (sin `*`) queda
-    fuera del subconjunto soportado y falla con un error explícito, nunca
-    con un `UnresolvedColumnError` críptico en mitad del ejecutor.
+    proyectado — donde `u.name AS n` se llama `n`, no `u.name`. Para ordenar
+    por una expresión que el usuario no proyectó (SQL válido: `SELECT v FROM
+    t ORDER BY id`), la clave se añade como columna proyectada oculta con un
+    alias interno y el engine la recorta del resultado — la alternativa,
+    inyectar nodos de plan propios, invadiría la responsabilidad del
+    optimizador.
     """
     if not stmt.order_by:
-        return ()
+        return (), (), ()
     has_star = any(isinstance(item.expression, pm.Star) for item in stmt.columns)
     named_items = [
         (item, _select_item_output_name(item))
@@ -158,7 +175,9 @@ def _normalize_order_by(stmt: pm.SelectStatement) -> tuple[om.OrderByItem, ...]:
     output_names = {name for _, name in named_items}
 
     normalized: list[om.OrderByItem] = []
-    for order_item in stmt.order_by:
+    extra_items: list[om.SelectItem] = []
+    hidden_names: list[str] = []
+    for position, order_item in enumerate(stmt.order_by):
         expr = order_item.expression
         direction = om.OrderDirection[order_item.direction.name]
         replacement: om.Expression | None = None
@@ -169,23 +188,23 @@ def _normalize_order_by(stmt: pm.SelectStatement) -> tuple[om.OrderByItem, ...]:
         if replacement is None and isinstance(expr, pm.ColumnRef) and expr.table is None:
             if expr.name in output_names:
                 replacement = om.ColumnRef(name=expr.name)
+        if replacement is None and has_star:
+            # Con `SELECT *` las columnas de origen atraviesan el proyector
+            # con su nombre cualificado: la clave original se resuelve tal
+            # cual, sin columna oculta.
+            replacement = expression_to_optimizer(expr)
         if replacement is None:
-            if has_star:
-                # Con `SELECT *` las columnas de origen atraviesan el
-                # proyector con su nombre cualificado: la clave original
-                # sigue siendo resoluble tal cual.
-                replacement = expression_to_optimizer(expr)
-            else:
-                raise NotSupportedError(
-                    "ORDER BY debe referenciar columnas de la lista SELECT "
-                    "(por alias, nombre o la misma expresión); ordenar por "
-                    "columnas no proyectadas no está soportado"
-                )
+            hidden = f"__order_by_{position}__"
+            extra_items.append(
+                om.SelectItem(expression=expression_to_optimizer(expr), alias=hidden)
+            )
+            hidden_names.append(hidden)
+            replacement = om.ColumnRef(name=hidden)
         normalized.append(om.OrderByItem(expression=replacement, direction=direction))
-    return tuple(normalized)
+    return tuple(normalized), tuple(extra_items), tuple(hidden_names)
 
 
-def select_to_optimizer(stmt: pm.SelectStatement) -> om.SelectStatement:
+def select_to_optimizer(stmt: pm.SelectStatement) -> TranslatedSelect:
     if stmt.distinct:
         # El optimizador acepta el campo `distinct` pero hoy no genera
         # ningún operador de deduplicación: ejecutarlo devolvería duplicados
@@ -194,11 +213,13 @@ def select_to_optimizer(stmt: pm.SelectStatement) -> om.SelectStatement:
             "SELECT DISTINCT no está soportado: el optimizador del ecosistema "
             "aún no planifica la deduplicación"
         )
-    return om.SelectStatement(
-        columns=tuple(
-            om.SelectItem(expression=expression_to_optimizer(item.expression), alias=item.alias)
-            for item in stmt.columns
-        ),
+    order_by, extra_items, hidden_names = _normalize_order_by(stmt)
+    columns = tuple(
+        om.SelectItem(expression=expression_to_optimizer(item.expression), alias=item.alias)
+        for item in stmt.columns
+    )
+    statement = om.SelectStatement(
+        columns=columns + extra_items,
         from_table=_table_ref_to_optimizer(stmt.from_table),
         distinct=False,
         joins=tuple(
@@ -212,10 +233,11 @@ def select_to_optimizer(stmt: pm.SelectStatement) -> om.SelectStatement:
         where=expression_to_optimizer(stmt.where) if stmt.where is not None else None,
         group_by=tuple(expression_to_optimizer(expr) for expr in stmt.group_by),
         having=expression_to_optimizer(stmt.having) if stmt.having is not None else None,
-        order_by=_normalize_order_by(stmt),
+        order_by=order_by,
         limit=stmt.limit,
         offset=stmt.offset,
     )
+    return TranslatedSelect(statement=statement, hidden_columns=hidden_names)
 
 
 # ---------------------------------------------------------------------------
