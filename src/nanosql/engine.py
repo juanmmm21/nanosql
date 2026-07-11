@@ -78,7 +78,7 @@ from .errors import (
 )
 from .rowstore import ROW_ID_SEPARATOR, DurableRowStore, make_row_id, split_row_id
 from .source import ROWID_COLUMN, MvccTableSource, decode_row_payload, encode_row_payload
-from .storage import BPlusTreeBackend, KeyValueBackend
+from .storage import BPlusTreeBackend, KeyValueBackend, LsmTreeBackend
 from .translate import (
     expression_to_optimizer,
     physical_plan_to_executor,
@@ -373,6 +373,8 @@ class DatabaseEngine:
     def _open_backend(backend_name: str, directory: Path) -> KeyValueBackend:
         if backend_name == BACKEND_BTREE:
             return BPlusTreeBackend(directory / "data.btree")
+        if backend_name == BACKEND_LSM:
+            return LsmTreeBackend(directory / "lsm")
         raise NotSupportedError(f"backend de storage desconocido: {backend_name!r}")
 
     @property

@@ -28,6 +28,8 @@ from bplus_tree_storage_engine import (
     PageCorruptionError,
     StorageIOError,
 )
+from lsm_tree_engine import LsmError, LsmTree
+from lsm_tree_engine import StorageIOError as LsmStorageIOError
 
 from .errors import InternalError, OperationalError
 
@@ -156,3 +158,79 @@ class BPlusTreeBackend:
             self._tree.close()
         except StorageIOError as exc:
             raise OperationalError(f"fallo de E/S cerrando el B+Tree: {exc}") from exc
+
+
+class LsmTreeBackend:
+    """`KeyValueBackend` sobre `lsm-tree-engine`.
+
+    El motor LSM gestiona su propio directorio (memtable + WAL interno +
+    SSTables por niveles + manifest) y sus borrados son tombstones
+    idempotentes, así que este adaptador es casi transparente: sólo traduce
+    excepciones. Nota de durabilidad: cada `put`/`delete` ya pasa por el WAL
+    interno del LSM con fsync; el WAL del ecosistema (`durability.py`) se
+    mantiene igualmente por encima para que ambos backends compartan un
+    único camino de recuperación — redundante, nunca incorrecto, y el coste
+    (dos fsync por commit) queda documentado en el benchmark del README.
+    """
+
+    def __init__(self, directory: Path) -> None:
+        try:
+            self._tree = LsmTree.open(directory)
+        except LsmStorageIOError as exc:
+            raise OperationalError(f"no se pudo abrir el storage LSM: {exc}") from exc
+        except LsmError as exc:
+            raise InternalError(f"storage LSM inconsistente al abrir: {exc}") from exc
+        self._closed = False
+
+    def put(self, key: bytes, value: bytes) -> None:
+        try:
+            self._tree.put(key, value)
+        except LsmStorageIOError as exc:
+            raise OperationalError(f"fallo de E/S escribiendo en el LSM: {exc}") from exc
+        except LsmError as exc:
+            raise InternalError(f"error del motor LSM en put: {exc}") from exc
+
+    def get(self, key: bytes) -> bytes | None:
+        try:
+            return self._tree.get(key)
+        except LsmStorageIOError as exc:
+            raise OperationalError(f"fallo de E/S leyendo del LSM: {exc}") from exc
+        except LsmError as exc:
+            raise InternalError(f"error del motor LSM en get: {exc}") from exc
+
+    def delete(self, key: bytes) -> None:
+        # El delete del LSM escribe un tombstone: borrar una clave ausente
+        # es válido por diseño (la idempotencia que exige el Protocol).
+        try:
+            self._tree.delete(key)
+        except LsmStorageIOError as exc:
+            raise OperationalError(f"fallo de E/S borrando del LSM: {exc}") from exc
+        except LsmError as exc:
+            raise InternalError(f"error del motor LSM en delete: {exc}") from exc
+
+    def scan(
+        self, start: bytes | None = None, end: bytes | None = None
+    ) -> Iterator[tuple[bytes, bytes]]:
+        try:
+            yield from self._tree.scan(start, end)
+        except LsmStorageIOError as exc:
+            raise OperationalError(f"fallo de E/S recorriendo el LSM: {exc}") from exc
+        except LsmError as exc:
+            raise InternalError(f"error del motor LSM en scan: {exc}") from exc
+
+    def flush(self) -> None:
+        try:
+            self._tree.flush()
+        except LsmStorageIOError as exc:
+            raise OperationalError(f"fallo de E/S en flush del LSM: {exc}") from exc
+        except LsmError as exc:
+            raise InternalError(f"error del motor LSM en flush: {exc}") from exc
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._tree.close()
+        except LsmStorageIOError as exc:
+            raise OperationalError(f"fallo de E/S cerrando el LSM: {exc}") from exc
