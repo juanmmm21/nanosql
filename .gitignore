@@ -1,0 +1,33 @@
+# Bytecode y cachés
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# Empaquetado
+build/
+dist/
+*.egg-info/
+
+# Configuración de editor / SO
+.vscode/
+.idea/
+.DS_Store
+
+# Bases de datos de prueba/demostración
+*.db/
+*.nanosql/
+
+# Contexto de agentes (nunca se trackea)
+AGENTS.md
+CLAUDE.md
+START_HERE.md
+.claude/

@@ -1,0 +1,84 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nanosql"
+version = "0.1.0"
+description = "An embeddable SQL engine with CLI/REPL and a Python driver, assembling from-scratch storage, transaction, query, and consensus engines."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Juan Martos Cuevas", email = "martoscuevasjuan@gmail.com" }]
+
+# Las dependencias son los propios subproyectos de strata-database-engine,
+# instalados directamente desde sus repositorios (referencias directas PEP 508).
+# nanosql es la única pieza del ecosistema autorizada a importarlos: los diez
+# repos se prohíben imports cruzados entre sí y la integración real vive aquí.
+dependencies = [
+    "write-ahead-log-recovery @ git+https://github.com/juanmmm21/write-ahead-log-recovery.git",
+    "bplus-tree-storage-engine @ git+https://github.com/juanmmm21/bplus-tree-storage-engine.git",
+    "lsm-tree-engine @ git+https://github.com/juanmmm21/lsm-tree-engine.git",
+    "mvcc-transaction-manager @ git+https://github.com/juanmmm21/mvcc-transaction-manager.git",
+    "lock-manager-deadlock-detector @ git+https://github.com/juanmmm21/lock-manager-deadlock-detector.git",
+    "sql-query-parser @ git+https://github.com/juanmmm21/sql-query-parser.git",
+    "cost-based-query-optimizer @ git+https://github.com/juanmmm21/cost-based-query-optimizer.git",
+    "vectorized-execution-engine @ git+https://github.com/juanmmm21/vectorized-execution-engine.git",
+]
+
+[project.optional-dependencies]
+# Modo distribuido opcional (no requerido para el uso embebido de nodo único).
+distributed = [
+    "raft-replication-log @ git+https://github.com/juanmmm21/raft-replication-log.git",
+    "distributed-query-router @ git+https://github.com/juanmmm21/distributed-query-router.git",
+]
+dev = ["pytest>=8.0", "mypy>=1.14", "ruff>=0.6"]
+
+[project.urls]
+Repository = "https://github.com/juanmmm21/nanosql"
+
+[project.scripts]
+nanosql = "nanosql.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nanosql"]
+
+[tool.hatch.metadata]
+# Necesario para que hatchling acepte dependencias por URL directa de git.
+allow-direct-references = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.mypy]
+# Sin `python_version` fijo: las stubs de NumPy (dependencia transitiva vía
+# vectorized-execution-engine) usan sintaxis PEP 695 que mypy solo parsea
+# con >=3.12 — misma lección documentada en PROGRESS.md del ecosistema.
+strict = true
+files = ["src"]
+
+# Los diez subproyectos publican type hints completos pero (aún) no incluyen
+# el marcador `py.typed`, así que mypy los trataría como no tipados. En vez
+# de degradarlos a `Any` con `ignore_missing_imports`, se analizan sus
+# fuentes instaladas con tipado completo.
+[[tool.mypy.overrides]]
+module = [
+    "write_ahead_log_recovery.*",
+    "bplus_tree_storage_engine.*",
+    "lsm_tree_engine.*",
+    "mvcc_transaction_manager.*",
+    "lock_manager_deadlock_detector.*",
+    "sql_query_parser.*",
+    "cost_based_query_optimizer.*",
+    "vectorized_execution_engine.*",
+    "raft_replication_log.*",
+    "distributed_query_router.*",
+]
+follow_untyped_imports = true
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "N"]
