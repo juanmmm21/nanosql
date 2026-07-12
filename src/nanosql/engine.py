@@ -34,7 +34,8 @@ import cost_based_query_optimizer.models as om
 import numpy as np
 import sql_query_parser.models as pm
 import vectorized_execution_engine.errors as vec_errors
-from cost_based_query_optimizer.pipeline import optimize
+from cost_based_query_optimizer.pipeline import OptimizationResult, optimize
+from cost_based_query_optimizer.pipeline import explain as optimizer_explain
 from lock_manager_deadlock_detector import (
     DeadlockAbortError,
     LockManager,
@@ -268,7 +269,6 @@ class DatabaseEngine:
         self._durability = durability
         self._catalog = catalog
         self._row_store = DurableRowStore(kv, durability)
-        self._mvcc = MVCCTransactionManager(self._row_store)
         self._locks: LockManager[str] = LockManager(default_timeout=lock_timeout)
         self._lock = threading.RLock()
         self._gc_interval = gc_interval
@@ -277,23 +277,19 @@ class DatabaseEngine:
         self._commits_since_checkpoint = 0
         self._next_rowid: dict[str, int] = {}
         self._live_counts: dict[str, int] = {}
-        self._txn_written_tables: dict[TransactionId, set[str]] = {}
+        self._txn_written_rows: dict[TransactionId, dict[str, set[int]]] = {}
         self._closed = False
 
         summary = self._row_store.bootstrap_summary()
         for table, info in summary.tables.items():
             self._next_rowid[table] = info.max_rowid + 1
             self._live_counts[table] = info.live_rows
-        if summary.max_commit_seq > 0:
-            # mvcc-transaction-manager arranca su contador de commits en 0 y
-            # no expone (todavía) una forma de sembrarlo al reabrir un store
-            # persistido: sin esto, ningún dato previo sería visible (todo
-            # commit_seq quedaría por encima de cualquier horizonte nuevo) y
-            # las claves de versión nuevas colisionarían con las antiguas.
-            # Workaround consciente sobre estado privado, reportado como
-            # mejora pendiente del subproyecto; se retirará cuando el gestor
-            # acepte el valor inicial por constructor.
-            self._mvcc._last_committed_seq = summary.max_commit_seq
+        # El contador de commits se siembra con el máximo commit_seq ya
+        # materializado (API oficial del gestor desde que aceptó el seed por
+        # constructor): sin él, nada persistido sería visible al reabrir.
+        self._mvcc = MVCCTransactionManager(
+            self._row_store, last_committed_seq=summary.max_commit_seq
+        )
 
     # ------------------------------------------------------------------
     # Apertura
@@ -393,40 +389,108 @@ class DatabaseEngine:
         with self._lock:
             self._ensure_open()
             txn_id = self._mvcc.begin(isolation)
-            self._txn_written_tables[txn_id] = set()
+            self._txn_written_rows[txn_id] = {}
             return txn_id
 
     def commit(self, txn_id: TransactionId) -> None:
-        with self._lock:
-            self._ensure_open()
-            written = self._txn_written_tables.pop(txn_id, set())
-            wal_txn: int | None = None
-            if self._durability is not None and written:
-                wal_txn = self._durability.begin()
-                self._row_store.begin_logged_batch(wal_txn)
+        # try/finally sobre TODO el commit: un commit fallido (conflicto,
+        # violación de unicidad, transacción muerta) también debe liberar
+        # los locks de tabla de la transacción — retenerlos bloquearía
+        # cualquier DDL futuro sobre esas tablas para siempre.
+        try:
+            with self._lock:
+                self._ensure_open()
+                written = self._txn_written_rows.pop(txn_id, {})
+                try:
+                    self._validate_unique_at_commit(txn_id, written)
+                except IntegrityError:
+                    # La transacción no puede confirmarse tal cual; se
+                    # aborta (mismo contrato que un conflicto de escritura:
+                    # el llamador reintenta la transacción entera).
+                    self._mvcc.abort(txn_id)
+                    raise
+                wal_txn: int | None = None
+                if self._durability is not None and written:
+                    wal_txn = self._durability.begin()
+                    self._row_store.begin_logged_batch(wal_txn)
+                try:
+                    self._mvcc.commit(txn_id)
+                except (WriteConflictError, SerializationConflictError) as exc:
+                    # El gestor detecta el conflicto ANTES de materializar
+                    # nada: la transacción WAL, si existe, se cierra vacía.
+                    if wal_txn is not None:
+                        self._durability_abort(wal_txn)
+                    raise TransactionConflictError(str(exc)) from exc
+                except TransactionNotActiveError as exc:
+                    if wal_txn is not None:
+                        self._durability_abort(wal_txn)
+                    raise ProgrammingError(str(exc)) from exc
+                finally:
+                    self._row_store.end_logged_batch()
+                if wal_txn is not None and self._durability is not None:
+                    self._durability.commit(wal_txn)
+                for table in written:
+                    self._live_counts.pop(table, None)
+                if written:
+                    self._commits_since_gc += 1
+                    self._commits_since_checkpoint += 1
+                    self._maybe_run_maintenance()
+        finally:
+            self._locks.release_all(LockOwnerId(int(txn_id)))
+
+    def _validate_unique_at_commit(
+        self, txn_id: TransactionId, written: dict[str, set[int]]
+    ) -> None:
+        """Revalidación de unicidad contra lo ÚLTIMO confirmado, en commit.
+
+        Las comprobaciones por sentencia validan contra el snapshot de la
+        propia transacción, que no ve lo que otra transacción concurrente
+        confirmó después: dos transacciones podían insertar el mismo valor
+        "único" sin verse. Como el lock de ejecución del engine serializa
+        los commits, revalidar aquí las filas escritas contra una vista
+        READ_COMMITTED fresca (excluyendo las propias filas escritas, que
+        esta transacción va a sobrescribir o borrar) cierra ese hueco por
+        completo dentro del proceso.
+        """
+        for table_name, rowids in written.items():
+            table = self._catalog.tables.get(table_name)
+            if table is None:
+                continue  # tabla con escrituras pero sin esquema: imposible salvo bug
+            constraints = self._unique_constraints(table)
+            if not constraints:
+                continue
+            mine: list[dict[str, ColumnValue]] = []
+            for rowid in rowids:
+                payload = self._mvcc.get(txn_id, make_row_id(table_name, rowid))
+                if payload is not None:  # los borrados no pueden crear duplicados
+                    mine.append(decode_row_payload(payload))
+            if not mine:
+                continue
+            probe = self._mvcc.begin(IsolationLevel.READ_COMMITTED)
             try:
-                self._mvcc.commit(txn_id)
-            except (WriteConflictError, SerializationConflictError) as exc:
-                # El gestor detecta el conflicto ANTES de materializar nada:
-                # la transacción WAL, si existe, se cierra vacía.
-                if wal_txn is not None:
-                    self._durability_abort(wal_txn)
-                raise TransactionConflictError(str(exc)) from exc
-            except TransactionNotActiveError as exc:
-                if wal_txn is not None:
-                    self._durability_abort(wal_txn)
-                raise ProgrammingError(str(exc)) from exc
+                committed = [
+                    row
+                    for rowid, row in self._visible_table_rows(probe, table_name)
+                    if rowid not in rowids
+                ]
             finally:
-                self._row_store.end_logged_batch()
-            if wal_txn is not None and self._durability is not None:
-                self._durability.commit(wal_txn)
-            for table in written:
-                self._live_counts.pop(table, None)
-            if written:
-                self._commits_since_gc += 1
-                self._commits_since_checkpoint += 1
-                self._maybe_run_maintenance()
-        self._locks.release_all(LockOwnerId(int(txn_id)))
+                self._mvcc.abort(probe)
+            for constraint in constraints:
+                existing: set[tuple[ColumnValue, ...]] = set()
+                for row in committed:
+                    committed_key = tuple(row.get(c) for c in constraint)
+                    if None not in committed_key:
+                        existing.add(committed_key)
+                for row in mine:
+                    key = tuple(row.get(c) for c in constraint)
+                    if None in key:
+                        continue
+                    if key in existing:
+                        raise IntegrityError(
+                            f"commit rechazado: otra transacción confirmó antes el valor "
+                            f"{key!r} para la restricción única "
+                            f"({', '.join(constraint)}) de '{table_name}'"
+                        )
 
     def transaction_active(self, txn_id: TransactionId) -> bool:
         try:
@@ -437,7 +501,7 @@ class DatabaseEngine:
     def rollback(self, txn_id: TransactionId) -> None:
         with self._lock:
             self._ensure_open()
-            self._txn_written_tables.pop(txn_id, None)
+            self._txn_written_rows.pop(txn_id, None)
             try:
                 self._mvcc.abort(txn_id)
             except TransactionNotActiveError:
@@ -563,17 +627,12 @@ class DatabaseEngine:
             rowcount=len(rows),
         )
 
-    def _run_select_plan(
-        self,
-        txn_id: TransactionId,
-        opt_select: om.SelectStatement,
-        tables: list[str],
-        *,
-        include_rowid: bool,
-    ) -> RowBatch:
+    def _optimize_select(
+        self, opt_select: om.SelectStatement, tables: list[str], *, include_rowid: bool
+    ) -> OptimizationResult:
         stats_catalog = self._optimizer_catalog(tables, include_rowid=include_rowid)
         try:
-            result = optimize(opt_select, stats_catalog)
+            return optimize(opt_select, stats_catalog)
         except opt_errors.UnresolvedColumnError as exc:
             raise ProgrammingError(f"columna no resuelta: {exc}") from exc
         except opt_errors.UnsupportedQueryError as exc:
@@ -583,6 +642,38 @@ class DatabaseEngine:
         except opt_errors.OptimizerError as exc:
             raise InternalError(f"el optimizador falló: {exc}") from exc
 
+    def explain_select(self, stmt: pm.SelectStatement) -> StatementResult:
+        """`EXPLAIN <select>`: el plan físico elegido por el optimizador con
+        cardinalidades y costes estimados, renderizado por el `explain` del
+        propio optimizador. Planifica contra las estadísticas actuales sin
+        abrir transacción ni tomar locks de tabla: no lee datos.
+        """
+        with self._lock:
+            self._ensure_open()
+            tables = [stmt.from_table.name] + [join.table.name for join in stmt.joins]
+            for table in tables:
+                self._catalog.table(table)
+            translated = select_to_optimizer(stmt)
+            result = self._optimize_select(translated.statement, tables, include_rowid=False)
+        text = optimizer_explain(result.physical_plan)
+        rows: list[tuple[ColumnValue, ...]] = [(line,) for line in text.splitlines()]
+        return StatementResult(
+            kind="explain",
+            columns=("query plan",),
+            column_types=("STRING",),
+            rows=rows,
+            rowcount=len(rows),
+        )
+
+    def _run_select_plan(
+        self,
+        txn_id: TransactionId,
+        opt_select: om.SelectStatement,
+        tables: list[str],
+        *,
+        include_rowid: bool,
+    ) -> RowBatch:
+        result = self._optimize_select(opt_select, tables, include_rowid=include_rowid)
         plan = physical_plan_to_executor(result.physical_plan)
         source = MvccTableSource(self._mvcc, txn_id, self._catalog, include_rowid=include_rowid)
         try:
@@ -672,12 +763,15 @@ class DatabaseEngine:
 
         self._check_unique_constraints(txn_id, table, new_rows, exclude_rowids=set())
 
-        written = self._txn_written_tables.setdefault(txn_id, set())
         for row in new_rows:
             rowid = self._allocate_rowid(table.name)
             self._mvcc_put(txn_id, table.name, rowid, row)
-        written.add(table.name)
+            self._record_write(txn_id, table.name, rowid)
         return StatementResult(kind="insert", rowcount=len(new_rows))
+
+    def _record_write(self, txn_id: TransactionId, table: str, rowid: int) -> None:
+        per_table = self._txn_written_rows.setdefault(txn_id, {})
+        per_table.setdefault(table, set()).add(rowid)
 
     def _allocate_rowid(self, table: str) -> int:
         rowid = self._next_rowid.get(table, 1)
@@ -887,17 +981,15 @@ class DatabaseEngine:
                 exclude_rowids={rowid for rowid, _ in updated_rows},
             )
 
-        written = self._txn_written_tables.setdefault(txn_id, set())
         for rowid, row in updated_rows:
             self._mvcc_put(txn_id, stmt.table, rowid, row)
-        written.add(stmt.table)
+            self._record_write(txn_id, stmt.table, rowid)
         return StatementResult(kind="update", rowcount=len(updated_rows))
 
     def _execute_delete(self, txn_id: TransactionId, stmt: pm.DeleteStatement) -> StatementResult:
         self._catalog.table(stmt.table)
         batch = self._matching_rows(txn_id, stmt.table, stmt.where, extra_items=[])
         matched = _batch_to_rows(batch)
-        written = self._txn_written_tables.setdefault(txn_id, set())
         for (rowid,) in matched:
             if not isinstance(rowid, int):
                 raise InternalError(f"__rowid__ no entero en el plan de DELETE: {rowid!r}")
@@ -905,8 +997,7 @@ class DatabaseEngine:
                 self._mvcc.delete(txn_id, make_row_id(stmt.table, rowid))
             except TransactionNotActiveError as exc:
                 raise ProgrammingError(str(exc)) from exc
-        if matched:
-            written.add(stmt.table)
+            self._record_write(txn_id, stmt.table, rowid)
         return StatementResult(kind="delete", rowcount=len(matched))
 
     # -- DDL --------------------------------------------------------------

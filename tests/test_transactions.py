@@ -183,6 +183,58 @@ class TestIsolationLevels:
         reader.close()
 
 
+class TestCommitTimeUniqueValidation:
+    def test_concurrent_duplicate_unique_value_rejected_at_commit(self, db: Path) -> None:
+        # El hueco clásico de unicidad bajo MVCC optimista: dos transacciones
+        # insertan el mismo valor "único" sin verse (filas distintas, así que
+        # first-committer-wins no salta). La revalidación en commit contra lo
+        # último confirmado debe rechazar a la segunda.
+        setup = nanosql.connect(db)
+        setup.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, email VARCHAR(40) UNIQUE)")
+        setup.commit()
+        a = nanosql.connect(db)
+        b = nanosql.connect(db)
+        a.execute("INSERT INTO u (id, email) VALUES (1, 'ada@x')")
+        b.execute("INSERT INTO u (id, email) VALUES (2, 'ada@x')")
+        a.commit()
+        with pytest.raises(nanosql.IntegrityError):
+            b.commit()
+        # b quedó abortada; el dato confirmado es el de a, único.
+        check = setup.execute("SELECT COUNT(*) FROM u").fetchall()
+        assert check == [(1,)]
+        for c in (setup, a, b):
+            c.close()
+
+    def test_delete_and_reinsert_same_unique_value_in_one_txn(self, db: Path) -> None:
+        # La revalidación debe excluir las filas que esta misma transacción
+        # borró: mover un valor único de una fila a otra es legal.
+        conn = nanosql.connect(db)
+        conn.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, email VARCHAR(40) UNIQUE)")
+        conn.execute("INSERT INTO u (id, email) VALUES (1, 'ada@x')")
+        conn.commit()
+        conn.execute("DELETE FROM u WHERE id = 1")
+        conn.execute("INSERT INTO u (id, email) VALUES (2, 'ada@x')")
+        conn.commit()
+        assert conn.execute("SELECT id FROM u").fetchall() == [(2,)]
+        conn.close()
+
+    def test_failed_commit_releases_table_locks(self, db: Path) -> None:
+        # Regresión: un commit que fallaba por conflicto retenía los locks
+        # SHARED de la transacción para siempre, bloqueando cualquier DDL
+        # posterior sobre esas tablas hasta agotar timeout.
+        a = nanosql.connect(db, lock_timeout=0.5)
+        b = nanosql.connect(db, lock_timeout=0.5)
+        a.execute("UPDATE cuentas SET saldo = 1 WHERE id = 1")
+        b.execute("UPDATE cuentas SET saldo = 2 WHERE id = 1")
+        a.commit()
+        with pytest.raises(TransactionConflictError):
+            b.commit()
+        ddl = nanosql.connect(db, lock_timeout=0.5)
+        ddl.execute("CREATE INDEX ix_saldo_leak ON cuentas (saldo)")  # no debe agotar timeout
+        for c in (a, b, ddl):
+            c.close()
+
+
 class TestDdlLocking:
     def test_ddl_waits_for_readers_and_times_out(self, db: Path) -> None:
         # `reader` mantiene un lock SHARED sobre `cuentas` en su transacción
