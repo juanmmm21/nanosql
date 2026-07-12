@@ -150,6 +150,20 @@ mydata.db/
   with the same `WHERE`, so predicate evaluation (vectorized) and SET
   expressions run through the optimizer and executor, never through a
   second interpreter.
+* **Subqueries.** Uncorrelated subqueries are evaluated bottom-up by
+  materialization *before* translation to the optimizer (the same pipeline
+  stage where `?` parameters are bound): each `(SELECT ...)` is an
+  independent statement executed recursively under the *same*
+  transaction/snapshot as its outer query, and its result is substituted
+  into the AST — a list of literals for `IN (SELECT ...)`, a single literal
+  for the scalar position. The optimizer and executor then run unchanged,
+  with no notion that subqueries ever existed; nesting falls out of the
+  recursion. The honest cost: an `IN` subquery's result is materialized
+  in memory as a literal list, proportional to the rows it projects — fine
+  for the selective subqueries this engine targets, and the reason the
+  planned-semi-join alternative is documented as the natural evolution
+  rather than implemented. Table locks cover subquery tables too, at any
+  nesting depth.
 * **Concurrency model.** MVCC resolves row conflicts optimistically
   (first-committer-wins); the lock manager is used only at table
   granularity to fence DDL against in-flight transactions. Statement
@@ -268,12 +282,21 @@ SELECT FROM t
 with `INNER/LEFT/RIGHT/FULL JOIN`, `WHERE`, `GROUP BY`, `HAVING`,
 `COUNT/SUM/AVG/MIN/MAX` (plus `DISTINCT` inside aggregates), `ORDER BY`,
 `LIMIT/OFFSET`, `UPDATE ... SET` with expressions, `DELETE`, qmark (`?`)
-query parameters, and driver-level `BEGIN/COMMIT/ROLLBACK` plus
-`EXPLAIN <select>`.
+query parameters, **uncorrelated subqueries** — both scalar
+(`WHERE v > (SELECT AVG(v) FROM t)`, zero rows ⇒ `NULL`, more than one row ⇒
+`DataError`) and membership (`[NOT] IN (SELECT one_column FROM ...)`, with
+correct three-valued `NOT IN` semantics when the subquery result contains
+`NULL`s), nestable and parameterizable — and driver-level
+`BEGIN/COMMIT/ROLLBACK` plus `EXPLAIN <select>`.
 
 Documented limitations (typed `NotSupportedError`/`ProgrammingError`, never
-silent wrong answers): no subqueries, no composite primary keys (use a
-multi-column `UNIQUE` index), no `DATE/TIME/TIMESTAMP` column types. With
+silent wrong answers): no **correlated** subqueries (a subquery column that
+only resolves against the outer query is detected statically and rejected
+with a clear `NotSupportedError`, never a cryptic downstream error), no
+derived tables (`FROM (SELECT ...)`), no `EXISTS`, no `EXPLAIN` over queries
+containing subqueries (materialization would have to execute them to plan),
+no composite primary keys (use a multi-column `UNIQUE` index), no
+`DATE/TIME/TIMESTAMP` column types. With
 `SELECT DISTINCT`, `ORDER BY` may only reference columns of the select list
 (standard SQL: a hidden sort key would change the deduplication).
 Identifiers are case-sensitive. DDL implicitly commits the open transaction
@@ -326,6 +349,11 @@ result = sharded.aggregate(
 )   # AVG merged from per-shard (sum, count) partials — exact, never avg-of-avgs
 ```
 
+Sharded `select()` rejects subqueries with `NotSupportedError`: each shard
+would evaluate the subquery against its local rows only, silently producing
+a wrong global membership set (replicated mode has no such restriction —
+every node holds the full database).
+
 Both are in-process simulations (no sockets), matching the scope of their
 underlying repositories: the goal is real protocol integration —
 quorum commits, leader failover, database-as-state-machine snapshots,
@@ -335,7 +363,7 @@ partial results on shard failure — not multi-machine deployment.
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -e ".[distributed,dev]"
-.venv/bin/pytest              # 163 tests
+.venv/bin/pytest              # 192 tests
 .venv/bin/ruff check . && .venv/bin/ruff format --check .
 .venv/bin/mypy --strict src/
 ```
@@ -344,6 +372,8 @@ The test suite covers the DB-API surface, end-to-end SQL, isolation levels
 and conflicts (including write skew under `serializable`), DDL locking,
 typed errors, clean reopens, crash recovery (including rebuilding the
 database from the WAL alone after deleting the data file), backend parity,
+subquery semantics (three-valued `NOT IN` with `NULL`s, empty-set membership,
+scalar cardinality errors, correlation detection, shared MVCC snapshot),
 the distributed mode, and seeded property-based random workloads verified
 against an independent reference model on both backends.
 
