@@ -166,6 +166,15 @@ class DurableRowStore:
             versions.append(_decode_version(found_row_id, seq, data))
         return versions
 
+    def all_versions(self) -> Iterator[RowVersion]:
+        """Implementa el protocolo opcional `BulkRowStore` del gestor MVCC:
+        una única pasada ordenada sobre el backend en vez de un scan por
+        prefijo por cada fila — el camino que convierte la materialización
+        de un snapshot completo en UN range scan del B+Tree/LSM."""
+        for key, data in self._backend.scan():
+            row_id, seq = _decode_key(key)
+            yield _decode_version(row_id, seq, data)
+
     def row_ids(self) -> Iterator[RowId]:
         last: RowId | None = None
         for key, _ in self._backend.scan():
