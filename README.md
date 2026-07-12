@@ -33,12 +33,13 @@ conn.close()
 
 A single-node, embeddable, transactional SQL engine:
 
-* **DB-API 2.0 style Python driver** — `connect()`, `Cursor.execute()`,
+* **DB-API 2.0 style Python driver** — `connect()`, `Cursor.execute()` with
+  qmark (`?`) query parameters, `executemany()`,
   `fetchone/fetchmany/fetchall`, `description`, `rowcount`,
   `commit()`/`rollback()`, context-manager support.
 * **Interactive CLI/REPL** (`nanosql` in a terminal) with table-formatted
-  output, multi-line statements, `.tables`/`.schema` meta commands and a
-  built-in benchmark mode.
+  output, multi-line statements, `EXPLAIN` for inspecting physical plans,
+  `.tables`/`.schema` meta commands and a built-in benchmark mode.
 * **Real transactions** — `BEGIN`/`COMMIT`/`ROLLBACK` backed by MVCC
   snapshots with three isolation levels (`read_committed`,
   `repeatable_read`, `serializable`, including write-skew detection).
@@ -237,8 +238,16 @@ except nanosql.TransactionConflictError:
 
 with nanosql.connect(":memory:") as conn:            # commits on clean exit
     conn.execute("CREATE TABLE t (x INTEGER)")
-    conn.execute("INSERT INTO t (x) VALUES (1)")
+    conn.execute("INSERT INTO t (x) VALUES (?)", (1,))          # qmark parameters
+    conn.cursor().executemany(
+        "INSERT INTO t (x) VALUES (?)", [(2,), (3,), (4,)]
+    )
+    print(conn.execute("EXPLAIN SELECT x FROM t WHERE x > ?", (2,)).fetchall())
 ```
+
+Parameters are bound onto the typed AST (never re-interpolated as SQL
+text), so quotes and semicolons inside a string parameter are data, not
+syntax — injection-safe by construction.
 
 Exceptions follow the DB-API hierarchy (`ProgrammingError`, `DataError`,
 `IntegrityError`, `OperationalError`, `NotSupportedError`,
@@ -255,22 +264,25 @@ SELECT FROM t
 
 `CREATE TABLE` (INTEGER/FLOAT/VARCHAR/TEXT/BOOLEAN families, `PRIMARY KEY`,
 `NOT NULL`, `UNIQUE`, `DEFAULT`, `IF NOT EXISTS`), `CREATE [UNIQUE] INDEX`,
-`INSERT` (multi-row, with or without a column list), `SELECT` with
-`INNER/LEFT/RIGHT/FULL JOIN`, `WHERE`, `GROUP BY`, `HAVING`,
+`INSERT` (multi-row, with or without a column list), `SELECT [DISTINCT]`
+with `INNER/LEFT/RIGHT/FULL JOIN`, `WHERE`, `GROUP BY`, `HAVING`,
 `COUNT/SUM/AVG/MIN/MAX` (plus `DISTINCT` inside aggregates), `ORDER BY`,
-`LIMIT/OFFSET`, `UPDATE ... SET` with expressions, `DELETE`, and
-driver-level `BEGIN/COMMIT/ROLLBACK`.
+`LIMIT/OFFSET`, `UPDATE ... SET` with expressions, `DELETE`, qmark (`?`)
+query parameters, and driver-level `BEGIN/COMMIT/ROLLBACK` plus
+`EXPLAIN <select>`.
 
 Documented limitations (typed `NotSupportedError`/`ProgrammingError`, never
-silent wrong answers): no subqueries, no `SELECT DISTINCT`, no composite
-primary keys (use a multi-column `UNIQUE` index), no `DATE/TIME/TIMESTAMP`
-column types, no query parameters (`?`). Identifiers are case-sensitive.
-DDL implicitly commits the open transaction (MySQL-style) — that is what
-lets it take the EXCLUSIVE table lock without self-deadlocking. `UNIQUE`
-enforcement is validated against the writing transaction's snapshot: two
-*concurrent* transactions can insert the same "unique" value; closing that
-hole needs commit-time index validation inside the MVCC manager (reported
-upstream, intentionally not patched locally).
+silent wrong answers): no subqueries, no composite primary keys (use a
+multi-column `UNIQUE` index), no `DATE/TIME/TIMESTAMP` column types. With
+`SELECT DISTINCT`, `ORDER BY` may only reference columns of the select list
+(standard SQL: a hidden sort key would change the deduplication).
+Identifiers are case-sensitive. DDL implicitly commits the open transaction
+(MySQL-style) — that is what lets it take the EXCLUSIVE table lock without
+self-deadlocking. `UNIQUE` constraints are enforced twice: per statement
+against the transaction's snapshot, and again at commit against the latest
+committed state (commits are serialized by the engine lock), so two
+concurrent transactions inserting the same "unique" value cannot both
+succeed — the second commit fails with `IntegrityError`.
 
 ## Backend configuration
 
@@ -323,7 +335,7 @@ partial results on shard failure — not multi-machine deployment.
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -e ".[distributed,dev]"
-.venv/bin/pytest              # 137 tests
+.venv/bin/pytest              # 163 tests
 .venv/bin/ruff check . && .venv/bin/ruff format --check .
 .venv/bin/mypy --strict src/
 ```
@@ -335,10 +347,8 @@ database from the WAL alone after deleting the data file), backend parity,
 the distributed mode, and seeded property-based random workloads verified
 against an independent reference model on both backends.
 
-Because the ten dependencies publish complete type hints but no `py.typed`
-marker yet, `pyproject.toml` enables mypy's `follow_untyped_imports` for
-them — the integration layer is type-checked against their real signatures,
-not `Any`.
+All ten dependencies ship a `py.typed` marker, so `mypy --strict` checks
+the integration layer against their real signatures with no overrides.
 
 ## Benchmarks
 
@@ -348,33 +358,32 @@ WAL → storage) on every operation:
 
 | backend | operation | ops | seconds | ops/s |
 |---|---|---:|---:|---:|
-| btree | insert (commit every 200 rows) | 2000 | 0.697 | 2870.4 |
-| btree | point select by pk | 100 | 12.830 | 7.8 |
-| btree | aggregate group-by (full table) | 20 | 2.642 | 7.6 |
-| btree | join + aggregate + top-10 | 10 | 2.571 | 3.9 |
-| btree | bulk update (with expression) | 210 | 0.185 | 1133.1 |
-| lsm | insert (commit every 200 rows) | 2000 | 0.563 | 3552.9 |
-| lsm | point select by pk | 100 | 11.231 | 8.9 |
-| lsm | aggregate group-by (full table) | 20 | 2.273 | 8.8 |
-| lsm | join + aggregate + top-10 | 10 | 2.246 | 4.5 |
-| lsm | bulk update (with expression) | 210 | 0.150 | 1404.6 |
+| btree | insert (commit every 200 rows) | 2000 | 0.339 | 5900.7 |
+| btree | point select by pk | 100 | 0.594 | 168.3 |
+| btree | aggregate group-by (full table) | 20 | 0.138 | 145.1 |
+| btree | join + aggregate + top-10 | 10 | 0.112 | 89.6 |
+| btree | bulk update (with expression) | 210 | 0.069 | 3051.0 |
+| lsm | insert (commit every 200 rows) | 2000 | 0.326 | 6137.8 |
+| lsm | point select by pk | 100 | 0.509 | 196.6 |
+| lsm | aggregate group-by (full table) | 20 | 0.120 | 166.2 |
+| lsm | join + aggregate + top-10 | 10 | 0.092 | 108.3 |
+| lsm | bulk update (with expression) | 210 | 0.047 | 4515.3 |
 
 Honest reading of these numbers:
 
-* **Writes are fsync-bound and healthy** (~3 000 rows/s with per-commit
+* **Writes are fsync-bound and healthy** (~6 000 rows/s with per-commit
   durability; the LSM backend wins as expected from its append-only design).
-* **Reads are dominated by snapshot materialization, not by execution.**
-  Every query rebuilds its visible snapshot through the `RowStore`
-  protocol — one version-chain lookup per row plus a JSON payload decode —
-  before the vectorized executor ever sees a batch. A point select on a
-  2 000-row table costs ~120 ms of which the executor accounts for a small
-  fraction. A bulk visible-snapshot API in `mvcc-transaction-manager`
-  (one range scan instead of N point lookups) is the single highest-impact
-  improvement available and has been reported upstream; a full-database
-  cache inside nanosql was rejected because the ecosystem rules require
-  bounded caches with explicit eviction.
-* Secondary indexes influence *plan* selection but execute as filtered
-  scans — the executor's documented `IndexScanOperator` contract.
+* **Reads improved ~20x over the first release.** Snapshot materialization
+  originally performed one version-chain lookup per row through the
+  `RowStore` protocol; the `BulkRowStore` extension added to
+  `mvcc-transaction-manager` (one ordered range scan over the whole store
+  per snapshot, contributed back upstream from this project's benchmark
+  findings) removed that cost. What remains per query is decoding the
+  visible rows' JSON payloads into columnar batches — a point select on a
+  2 000-row table now costs ~6 ms instead of ~120 ms.
+* Secondary indexes influence *plan* selection (visible via `EXPLAIN`) but
+  execute as filtered scans — the executor's documented
+  `IndexScanOperator` contract.
 
 ## Troubleshooting
 
