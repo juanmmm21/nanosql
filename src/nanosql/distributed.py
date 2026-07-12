@@ -53,10 +53,12 @@ from distributed_query_router.sharding import HashShardingScheme, ShardDirectory
 from raft_replication_log.cluster import Cluster
 from raft_replication_log.errors import RaftError
 from raft_replication_log.pipeline import build_cluster, elect_leader, replicate_command
+from sql_query_parser import SqlParserError, parse
 
 from .catalog import ColumnValue, TableSchema
 from .driver import Connection, connect
-from .errors import OperationalError, ProgrammingError
+from .errors import NotSupportedError, OperationalError, ProgrammingError
+from .subqueries import contains_subquery
 
 # Ticks extra tras comprometer una entrada: los seguidores conocen el nuevo
 # commit_index del líder en el siguiente heartbeat (cada 3 ticks en la
@@ -417,6 +419,18 @@ class ShardedNanosql:
     ) -> MergedResult:
         """Fan-out de un SELECT literal a todos los shards; las filas se
         concatenan sin deduplicar (cada fila vive en exactamente un shard)."""
+        try:
+            statement = parse(sql)
+        except SqlParserError:
+            statement = None  # el error lo reportará (bien formateado) cada shard
+        if statement is not None and contains_subquery(statement):
+            # Cada shard evaluaría la subconsulta SOLO contra sus filas
+            # locales: la pertenencia global resultante sería incorrecta en
+            # silencio. Mejor un error honesto que un resultado plausible.
+            raise NotSupportedError(
+                "las subconsultas no están soportadas en modo shardeado: cada shard "
+                "las evaluaría únicamente con sus filas locales"
+            )
         payload = json.dumps({"kind": "sql", "sql": sql}).encode("utf-8")
         try:
             return self._router.execute_read(ReadRequest(payload=payload, consistency=consistency))
