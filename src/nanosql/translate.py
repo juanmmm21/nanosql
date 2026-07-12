@@ -26,7 +26,7 @@ import sql_query_parser.models as pm
 import vectorized_execution_engine.models as vm
 from vectorized_execution_engine.expressions import expression_key
 
-from .errors import InternalError, NotSupportedError
+from .errors import InternalError, NotSupportedError, ProgrammingError
 
 
 def _check_enum_parity() -> None:
@@ -193,6 +193,14 @@ def _normalize_order_by(
             # con su nombre cualificado: la clave original se resuelve tal
             # cual, sin columna oculta.
             replacement = expression_to_optimizer(expr)
+        if replacement is None and stmt.distinct:
+            # Con DISTINCT, una clave de ORDER BY que no sea columna de la
+            # lista SELECT cambiaría el resultado (la columna oculta entraría
+            # en la deduplicación). SQL estándar lo prohíbe; nosotros también.
+            raise ProgrammingError(
+                "con SELECT DISTINCT, ORDER BY solo puede referenciar "
+                "columnas de la propia lista SELECT"
+            )
         if replacement is None:
             hidden = f"__order_by_{position}__"
             extra_items.append(
@@ -205,14 +213,6 @@ def _normalize_order_by(
 
 
 def select_to_optimizer(stmt: pm.SelectStatement) -> TranslatedSelect:
-    if stmt.distinct:
-        # El optimizador acepta el campo `distinct` pero hoy no genera
-        # ningún operador de deduplicación: ejecutarlo devolvería duplicados
-        # en silencio. Mejor un error honesto que un resultado incorrecto.
-        raise NotSupportedError(
-            "SELECT DISTINCT no está soportado: el optimizador del ecosistema "
-            "aún no planifica la deduplicación"
-        )
     order_by, extra_items, hidden_names = _normalize_order_by(stmt)
     columns = tuple(
         om.SelectItem(expression=expression_to_optimizer(item.expression), alias=item.alias)
@@ -221,7 +221,7 @@ def select_to_optimizer(stmt: pm.SelectStatement) -> TranslatedSelect:
     statement = om.SelectStatement(
         columns=columns + extra_items,
         from_table=_table_ref_to_optimizer(stmt.from_table),
-        distinct=False,
+        distinct=stmt.distinct,
         joins=tuple(
             om.Join(
                 join_type=om.JoinType[join.join_type.name],
@@ -375,6 +375,12 @@ def physical_plan_to_executor(plan: oplan.PhysicalOperator) -> vm.PhysicalOperat
                 )
                 for item in plan.items
             ),
+            estimated_rows=plan.estimated_rows,
+            estimated_cost=plan.estimated_cost,
+        )
+    if isinstance(plan, oplan.PhysicalDistinct):
+        return vm.PhysicalDistinct(
+            input=physical_plan_to_executor(plan.input),
             estimated_rows=plan.estimated_rows,
             estimated_cost=plan.estimated_cost,
         )

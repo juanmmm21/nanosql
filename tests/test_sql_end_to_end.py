@@ -144,6 +144,28 @@ class TestAggregates:
         assert conn.execute("SELECT COUNT(*) FROM vacia").fetchall() == [(0,)]
 
 
+class TestDistinct:
+    def test_distinct_deduplicates_rows(self, conn: nanosql.Connection) -> None:
+        rows = conn.execute("SELECT DISTINCT user_id FROM orders").fetchall()
+        assert sorted(rows) == [(1,), (2,), (4,)]
+
+    def test_distinct_treats_nulls_as_equal(self, conn: nanosql.Connection) -> None:
+        conn.execute("INSERT INTO orders (id, user_id, amount, item) VALUES (90, 4, 2.0, NULL)")
+        rows = conn.execute("SELECT DISTINCT item FROM orders WHERE user_id = 4").fetchall()
+        assert rows == [(None,)]
+
+    def test_distinct_with_order_by_projected_column(self, conn: nanosql.Connection) -> None:
+        rows = conn.execute("SELECT DISTINCT user_id FROM orders ORDER BY user_id DESC").fetchall()
+        assert rows == [(4,), (2,), (1,)]
+
+    def test_distinct_multi_column(self, conn: nanosql.Connection) -> None:
+        conn.execute("INSERT INTO orders (id, user_id, amount, item) VALUES (91, 1, 12.5, 'libro')")
+        rows = conn.execute(
+            "SELECT DISTINCT user_id, item FROM orders WHERE item = 'libro'"
+        ).fetchall()
+        assert rows == [(1, "libro")]
+
+
 class TestDml:
     def test_insert_with_defaults(self, conn: nanosql.Connection) -> None:
         conn.execute("INSERT INTO users (id, name) VALUES (10, 'alan')")

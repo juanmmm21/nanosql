@@ -49,9 +49,11 @@ class TestSyntaxErrors:
         with pytest.raises(NotSupportedError):
             conn.execute("SELECT * FROM t WHERE id IN (SELECT id FROM t)")
 
-    def test_select_distinct_is_not_supported(self, conn: nanosql.Connection) -> None:
-        with pytest.raises(NotSupportedError):
-            conn.execute("SELECT DISTINCT name FROM t")
+    def test_distinct_order_by_unprojected_column_rejected(self, conn: nanosql.Connection) -> None:
+        # SQL estándar: con DISTINCT, ORDER BY solo puede usar columnas de
+        # la lista SELECT (una clave oculta cambiaría la deduplicación).
+        with pytest.raises(ProgrammingError):
+            conn.execute("SELECT DISTINCT name FROM t ORDER BY score")
 
     def test_order_by_unprojected_column_works_and_stays_hidden(
         self, conn: nanosql.Connection
