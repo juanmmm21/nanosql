@@ -3,7 +3,7 @@ strata-database-engine — storage (B+Tree/LSM), WAL, MVCC, locking, parser,
 optimizador y ejecutor vectorizado — detrás de un driver DB-API simplificado
 y un CLI/REPL."""
 
-from .driver import Connection, Cursor, apilevel, connect, threadsafety
+from .driver import Connection, Cursor, apilevel, connect, paramstyle, threadsafety
 from .errors import (
     DatabaseError,
     DataError,
@@ -34,5 +34,6 @@ __all__ = [
     "TransactionConflictError",
     "apilevel",
     "connect",
+    "paramstyle",
     "threadsafety",
 ]

@@ -18,6 +18,7 @@ mecanismo transaccional subyacente es siempre `mvcc-transaction-manager`.
 from __future__ import annotations
 
 import threading
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 from types import TracebackType
 
@@ -35,6 +36,8 @@ from sql_query_parser.protocols import CaretErrorFormatter
 
 from .catalog import ColumnValue
 from .engine import (
+    DEFAULT_CHECKPOINT_INTERVAL,
+    DEFAULT_GC_INTERVAL,
     MEMORY_PATH,
     DatabaseEngine,
     StatementResult,
@@ -45,8 +48,11 @@ from .errors import (
     NotSupportedError,
     ProgrammingError,
 )
+from .params import bind_statement
 
 apilevel = "2.0"
+# Estilo de parámetros DB-API: signos de interrogación posicionales.
+paramstyle = "qmark"
 # Nivel 1 de DB-API: se pueden compartir el módulo y (vía el registro de
 # engines) la base de datos entre hilos, pero no una misma Connection.
 threadsafety = 1
@@ -87,6 +93,31 @@ def classify_transaction_control(sql: str) -> str | None:
     return head.lower()
 
 
+def strip_explain_prefix(sql: str) -> str | None:
+    """Si `sql` empieza por `EXPLAIN`, devuelve el resto de la sentencia;
+    si no, `None`. Igual que el control de transacciones, EXPLAIN es una
+    orden del driver (no gramática del parser), detectada con el lexer real
+    para que comentarios y mayúsculas no importen."""
+    try:
+        tokens = tokenize(sql)
+    except SqlParserError:
+        return None
+    meaningful = [t for t in tokens if t.type is not pm.TokenType.EOF]
+    if (
+        len(meaningful) < 2
+        or meaningful[0].type is not pm.TokenType.IDENTIFIER
+        or meaningful[0].lexeme.upper() != "EXPLAIN"
+    ):
+        return None
+    # Offset absoluto del segundo token para rebanar el texto original.
+    second = meaningful[1].position
+    line_offsets = [0]
+    for line in sql.splitlines(keepends=True):
+        line_offsets.append(line_offsets[-1] + len(line))
+    cut = line_offsets[second.line - 1] + second.column - 1
+    return sql[cut:]
+
+
 # ---------------------------------------------------------------------------
 # Registro de engines compartidos por proceso
 # ---------------------------------------------------------------------------
@@ -100,11 +131,20 @@ def _acquire_engine(
     *,
     backend: str | None,
     lock_timeout: float,
+    gc_interval: int,
+    checkpoint_interval: int,
 ) -> tuple[DatabaseEngine, str | None]:
     """Devuelve `(engine, clave_de_registro)`. Las bases `:memory:` nunca se
     comparten (cada una es un universo privado de la conexión): clave None."""
     if str(database) == MEMORY_PATH:
-        return DatabaseEngine.open(database, backend=backend, lock_timeout=lock_timeout), None
+        engine = DatabaseEngine.open(
+            database,
+            backend=backend,
+            lock_timeout=lock_timeout,
+            gc_interval=gc_interval,
+            checkpoint_interval=checkpoint_interval,
+        )
+        return engine, None
     key = str(Path(database).expanduser().resolve())
     with _registry_lock:
         entry = _registry.get(key)
@@ -117,7 +157,13 @@ def _acquire_engine(
                 )
             _registry[key] = (engine, refcount + 1)
             return engine, key
-        engine = DatabaseEngine.open(database, backend=backend, lock_timeout=lock_timeout)
+        engine = DatabaseEngine.open(
+            database,
+            backend=backend,
+            lock_timeout=lock_timeout,
+            gc_interval=gc_interval,
+            checkpoint_interval=checkpoint_interval,
+        )
         _registry[key] = (engine, 1)
         return engine, key
 
@@ -165,7 +211,7 @@ class Cursor:
     ) -> list[tuple[str, str, None, None, None, None, None]] | None:
         """Sólo para SELECT: 7-tuplas `(nombre, tipo, ...)` al estilo DB-API,
         con el tipo como nombre del `ColumnType` del ejecutor."""
-        if self._result is None or self._result.kind != "select":
+        if self._result is None or self._result.kind not in ("select", "explain"):
             return None
         return [
             (name, type_name, None, None, None, None, None)
@@ -178,9 +224,31 @@ class Cursor:
 
     # -- ejecución ---------------------------------------------------------
 
-    def execute(self, sql: str) -> Cursor:
+    def execute(self, sql: str, params: Sequence[ColumnValue] | None = None) -> Cursor:
         connection = self._require_connection()
-        self._result = connection._execute_sql(sql)
+        self._result = connection._execute_sql(sql, params)
+        self._fetch_position = 0
+        return self
+
+    def executemany(self, sql: str, seq_of_params: Iterable[Sequence[ColumnValue]]) -> Cursor:
+        """Ejecuta `sql` una vez por cada tupla de parámetros. `rowcount`
+        agrega los de todas las ejecuciones (comportamiento DB-API)."""
+        connection = self._require_connection()
+        total = 0
+        last: StatementResult | None = None
+        for params in seq_of_params:
+            last = connection._execute_sql(sql, params)
+            if last.rowcount > 0:
+                total += last.rowcount
+        if last is None:
+            raise ProgrammingError("executemany requiere al menos una tupla de parámetros")
+        self._result = StatementResult(
+            kind=last.kind,
+            columns=last.columns,
+            column_types=last.column_types,
+            rows=last.rows,
+            rowcount=total,
+        )
         self._fetch_position = 0
         return self
 
@@ -196,7 +264,7 @@ class Cursor:
     # -- lectura de resultados ---------------------------------------------
 
     def _select_rows(self) -> list[tuple[ColumnValue, ...]]:
-        if self._result is None or self._result.kind != "select":
+        if self._result is None or self._result.kind not in ("select", "explain"):
             raise InterfaceError("no hay un resultado de SELECT que leer")
         return self._result.rows
 
@@ -293,9 +361,9 @@ class Connection:
         self._require_engine()
         return Cursor(self)
 
-    def execute(self, sql: str) -> Cursor:
+    def execute(self, sql: str, params: Sequence[ColumnValue] | None = None) -> Cursor:
         """Atajo DB-API: crea un cursor y ejecuta `sql` en él."""
-        return self.cursor().execute(sql)
+        return self.cursor().execute(sql, params)
 
     def commit(self) -> None:
         engine = self._require_engine()
@@ -350,19 +418,30 @@ class Connection:
             self._txn = engine.begin_transaction(self._isolation)
         return self._txn
 
-    def _execute_sql(self, sql: str) -> StatementResult:
+    def _execute_sql(
+        self, sql: str, params: Sequence[ColumnValue] | None = None
+    ) -> StatementResult:
         engine = self._require_engine()
         control = classify_transaction_control(sql)
         if control is not None:
+            if params:
+                raise ProgrammingError(f"{control.upper()} no admite parámetros")
             return self._execute_transaction_control(engine, control)
+        explained = strip_explain_prefix(sql)
+        to_parse = explained if explained is not None else sql
         try:
-            statement = parse(sql)
+            statement = parse(to_parse)
         except UnsupportedFeatureError as exc:
-            raise NotSupportedError(_format_syntax_error(exc, sql)) from exc
+            raise NotSupportedError(_format_syntax_error(exc, to_parse)) from exc
         except SqlSyntaxError as exc:
-            raise ProgrammingError(_format_syntax_error(exc, sql)) from exc
+            raise ProgrammingError(_format_syntax_error(exc, to_parse)) from exc
         except SqlParserError as exc:
             raise ProgrammingError(str(exc)) from exc
+        statement = bind_statement(statement, params)
+        if explained is not None:
+            if not isinstance(statement, pm.SelectStatement):
+                raise NotSupportedError("EXPLAIN solo soporta sentencias SELECT")
+            return engine.explain_select(statement)
         return self._execute_parsed(engine, statement)
 
     def _execute_script(self, script: str) -> list[StatementResult]:
@@ -433,6 +512,8 @@ def connect(
     isolation_level: str = "repeatable_read",
     autocommit: bool = False,
     lock_timeout: float = 10.0,
+    gc_interval: int = DEFAULT_GC_INTERVAL,
+    checkpoint_interval: int = DEFAULT_CHECKPOINT_INTERVAL,
 ) -> Connection:
     """Abre (o crea) una base de datos nanosql.
 
@@ -441,5 +522,11 @@ def connect(
     existente puede omitirse — queda registrado en su catálogo.
     """
     isolation = parse_isolation_level(isolation_level)
-    engine, key = _acquire_engine(database, backend=backend, lock_timeout=lock_timeout)
+    engine, key = _acquire_engine(
+        database,
+        backend=backend,
+        lock_timeout=lock_timeout,
+        gc_interval=gc_interval,
+        checkpoint_interval=checkpoint_interval,
+    )
     return Connection(engine, key, isolation, autocommit)
