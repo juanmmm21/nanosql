@@ -45,9 +45,12 @@ class TestSyntaxErrors:
         with pytest.raises(ProgrammingError):
             conn.execute("SELECT * FROM t WHERE name = 'sin cerrar")
 
-    def test_subquery_is_not_supported(self, conn: nanosql.Connection) -> None:
+    def test_derived_table_is_not_supported(self, conn: nanosql.Connection) -> None:
+        # Las subconsultas en posición de expresión SÍ están soportadas
+        # (ver test_subqueries.py); la tabla derivada en FROM sigue fuera
+        # del subconjunto y llega como NotSupportedError desde el parser.
         with pytest.raises(NotSupportedError):
-            conn.execute("SELECT * FROM t WHERE id IN (SELECT id FROM t)")
+            conn.execute("SELECT * FROM (SELECT id FROM t) d")
 
     def test_distinct_order_by_unprojected_column_rejected(self, conn: nanosql.Connection) -> None:
         # SQL estándar: con DISTINCT, ORDER BY solo puede usar columnas de

@@ -19,7 +19,10 @@ from .catalog import ColumnValue
 from .errors import DataError, ProgrammingError
 
 
-def _literal_for(value: ColumnValue) -> pm.Literal:
+def literal_for_value(value: ColumnValue) -> pm.Literal:
+    """Literal tipado del AST del parser para un valor Python plano. Público
+    dentro del paquete: lo comparte `subqueries.py` para materializar los
+    resultados de una subconsulta como literales."""
     # bool antes que int: en Python bool es subclase de int.
     if value is None:
         return pm.Literal(None, pm.LiteralType.NULL)
@@ -50,7 +53,7 @@ class _Binder:
                 f"la sentencia usa el parámetro ?{placeholder.index + 1} pero solo "
                 f"se pasaron {supplied} valores"
             )
-        return _literal_for(self._params[placeholder.index])
+        return literal_for_value(self._params[placeholder.index])
 
     def finish(self) -> None:
         supplied = 0 if self._params is None else len(self._params)
@@ -102,6 +105,17 @@ def _bind_expr(expr: pm.Expression, binder: _Binder) -> pm.Expression:
             distinct=expr.distinct,
             star_argument=expr.star_argument,
         )
+    if isinstance(expr, pm.Subquery):
+        # Los placeholders de una subconsulta comparten la numeración de su
+        # sentencia externa (contrato del parser): se ligan con el mismo
+        # binder, atravesando la subconsulta entera.
+        return pm.Subquery(statement=_bind_select(expr.statement, binder))
+    if isinstance(expr, pm.InSubquery):
+        return pm.InSubquery(
+            operand=_bind_expr(expr.operand, binder),
+            subquery=pm.Subquery(statement=_bind_select(expr.subquery.statement, binder)),
+            negated=expr.negated,
+        )
     # Nodo de expresión desconocido: se deja pasar tal cual — si contiene
     # algo no soportado lo dirá (tipado) la capa de traducción, no esta.
     return expr
@@ -109,6 +123,34 @@ def _bind_expr(expr: pm.Expression, binder: _Binder) -> pm.Expression:
 
 def _optional(expr: pm.Expression | None, binder: _Binder) -> pm.Expression | None:
     return None if expr is None else _bind_expr(expr, binder)
+
+
+def _bind_select(stmt: pm.SelectStatement, binder: _Binder) -> pm.SelectStatement:
+    return pm.SelectStatement(
+        columns=tuple(
+            pm.SelectItem(expression=_bind_expr(i.expression, binder), alias=i.alias)
+            for i in stmt.columns
+        ),
+        from_table=stmt.from_table,
+        distinct=stmt.distinct,
+        joins=tuple(
+            pm.Join(
+                join_type=j.join_type,
+                table=j.table,
+                on=_bind_expr(j.on, binder),
+            )
+            for j in stmt.joins
+        ),
+        where=_optional(stmt.where, binder),
+        group_by=tuple(_bind_expr(e, binder) for e in stmt.group_by),
+        having=_optional(stmt.having, binder),
+        order_by=tuple(
+            pm.OrderByItem(expression=_bind_expr(i.expression, binder), direction=i.direction)
+            for i in stmt.order_by
+        ),
+        limit=stmt.limit,
+        offset=stmt.offset,
+    )
 
 
 def bind_statement(stmt: pm.Statement, params: Sequence[ColumnValue] | None) -> pm.Statement:
@@ -121,31 +163,7 @@ def bind_statement(stmt: pm.Statement, params: Sequence[ColumnValue] | None) -> 
     binder = _Binder(params)
     bound: pm.Statement
     if isinstance(stmt, pm.SelectStatement):
-        bound = pm.SelectStatement(
-            columns=tuple(
-                pm.SelectItem(expression=_bind_expr(i.expression, binder), alias=i.alias)
-                for i in stmt.columns
-            ),
-            from_table=stmt.from_table,
-            distinct=stmt.distinct,
-            joins=tuple(
-                pm.Join(
-                    join_type=j.join_type,
-                    table=j.table,
-                    on=_bind_expr(j.on, binder),
-                )
-                for j in stmt.joins
-            ),
-            where=_optional(stmt.where, binder),
-            group_by=tuple(_bind_expr(e, binder) for e in stmt.group_by),
-            having=_optional(stmt.having, binder),
-            order_by=tuple(
-                pm.OrderByItem(expression=_bind_expr(i.expression, binder), direction=i.direction)
-                for i in stmt.order_by
-            ),
-            limit=stmt.limit,
-            offset=stmt.offset,
-        )
+        bound = _bind_select(stmt, binder)
     elif isinstance(stmt, pm.InsertStatement):
         bound = pm.InsertStatement(
             table=stmt.table,

@@ -80,6 +80,7 @@ from .errors import (
 from .rowstore import ROW_ID_SEPARATOR, DurableRowStore, make_row_id, split_row_id
 from .source import ROWID_COLUMN, MvccTableSource, decode_row_payload, encode_row_payload
 from .storage import BPlusTreeBackend, KeyValueBackend, LsmTreeBackend
+from .subqueries import contains_subquery, expand_statement, statement_tables
 from .translate import (
     expression_to_optimizer,
     physical_plan_to_executor,
@@ -544,28 +545,36 @@ class DatabaseEngine:
     # ------------------------------------------------------------------
 
     def execute_statement(self, txn_id: TransactionId, stmt: pm.Statement) -> StatementResult:
-        if isinstance(stmt, pm.SelectStatement):
-            tables = [stmt.from_table.name] + [join.table.name for join in stmt.joins]
-            self._acquire_table_locks(txn_id, tables, LockMode.SHARED)
-            with self._lock:
-                self._ensure_open()
+        if not isinstance(
+            stmt,
+            pm.SelectStatement | pm.InsertStatement | pm.UpdateStatement | pm.DeleteStatement,
+        ):
+            raise InternalError(f"sentencia no enrutable: {type(stmt).__name__}")
+        # Los locks SHARED cubren también las tablas de las subconsultas (a
+        # cualquier profundidad): la expansión las va a LEER bajo esta misma
+        # transacción, y deben quedar tan protegidas frente al DDL como las
+        # tablas de la sentencia externa.
+        self._acquire_table_locks(txn_id, statement_tables(stmt), LockMode.SHARED)
+        with self._lock:
+            self._ensure_open()
+            # Materialización de subconsultas ANTES de traducir/planificar,
+            # con el mismo txn (mismo snapshot MVCC) que la sentencia externa.
+            stmt = expand_statement(
+                stmt, self._catalog, lambda select: self._execute_select(txn_id, select)
+            )
+            if isinstance(stmt, pm.SelectStatement):
                 return self._execute_select(txn_id, stmt)
-        if isinstance(stmt, pm.InsertStatement):
-            self._acquire_table_locks(txn_id, [stmt.table], LockMode.SHARED)
-            with self._lock:
-                self._ensure_open()
+            if isinstance(stmt, pm.InsertStatement):
                 return self._execute_insert(txn_id, stmt)
-        if isinstance(stmt, pm.UpdateStatement):
-            self._acquire_table_locks(txn_id, [stmt.table], LockMode.SHARED)
-            with self._lock:
-                self._ensure_open()
+            if isinstance(stmt, pm.UpdateStatement):
                 return self._execute_update(txn_id, stmt)
-        if isinstance(stmt, pm.DeleteStatement):
-            self._acquire_table_locks(txn_id, [stmt.table], LockMode.SHARED)
-            with self._lock:
-                self._ensure_open()
+            if isinstance(stmt, pm.DeleteStatement):
                 return self._execute_delete(txn_id, stmt)
-        raise InternalError(f"sentencia no enrutable: {type(stmt).__name__}")
+            # Imposible por construcción: la expansión conserva el tipo de
+            # la sentencia; mypy no puede saberlo, un humano sí.
+            raise InternalError(
+                f"la expansión cambió el tipo de la sentencia: {type(stmt).__name__}"
+            )
 
     def execute_ddl(self, stmt: pm.Statement) -> StatementResult:
         """DDL bajo lock EXCLUSIVE de la tabla afectada. El llamador (la
@@ -648,6 +657,11 @@ class DatabaseEngine:
         propio optimizador. Planifica contra las estadísticas actuales sin
         abrir transacción ni tomar locks de tabla: no lee datos.
         """
+        if contains_subquery(stmt):
+            raise NotSupportedError(
+                "EXPLAIN no soporta consultas con subconsultas: la estrategia de "
+                "materialización tendría que ejecutarlas para poder planificar"
+            )
         with self._lock:
             self._ensure_open()
             tables = [stmt.from_table.name] + [join.table.name for join in stmt.joins]
