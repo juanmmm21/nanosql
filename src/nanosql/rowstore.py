@@ -61,6 +61,12 @@ def table_row_prefix(table: str) -> str:
     return f"{table}{ROW_ID_SEPARATOR}"
 
 
+def table_row_prefix_end(table: str) -> str:
+    """Cota superior exclusiva de los row_ids de `table` (el separador
+    0x1f incrementado): `[prefijo, fin)` contiene exactamente sus filas."""
+    return f"{table}{chr(ord(ROW_ID_SEPARATOR) + 1)}"
+
+
 def _encode_key(row_id: RowId, commit_seq: CommitSeq) -> bytes:
     return str(row_id).encode("utf-8") + KEY_SEPARATOR + _SEQ.pack(int(commit_seq))
 
@@ -172,6 +178,14 @@ class DurableRowStore:
         prefijo por cada fila — el camino que convierte la materialización
         de un snapshot completo en UN range scan del B+Tree/LSM."""
         for key, data in self._backend.scan():
+            row_id, seq = _decode_key(key)
+            yield _decode_version(row_id, seq, data)
+
+    def versions_in_range(self, start: RowId, end: RowId) -> Iterator[RowVersion]:
+        """Implementa `RangeRowStore` del gestor MVCC: las claves son
+        `row_id + 0x00 + seq`, así que el rango de row_ids [start, end) es
+        exactamente el rango de claves [start, end) del backend."""
+        for key, data in self._backend.scan(str(start).encode("utf-8"), str(end).encode("utf-8")):
             row_id, seq = _decode_key(key)
             yield _decode_version(row_id, seq, data)
 

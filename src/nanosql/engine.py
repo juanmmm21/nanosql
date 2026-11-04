@@ -49,6 +49,7 @@ from lock_manager_deadlock_detector import (
 from mvcc_transaction_manager import (
     IsolationLevel,
     MVCCTransactionManager,
+    RowId,
     SerializationConflictError,
     TransactionId,
     TransactionNotActiveError,
@@ -78,7 +79,14 @@ from .errors import (
     ProgrammingError,
     TransactionConflictError,
 )
-from .rowstore import ROW_ID_SEPARATOR, DurableRowStore, make_row_id, split_row_id
+from .rowstore import (
+    ROW_ID_SEPARATOR,
+    DurableRowStore,
+    make_row_id,
+    split_row_id,
+    table_row_prefix,
+    table_row_prefix_end,
+)
 from .source import ROWID_COLUMN, MvccTableSource, decode_row_payload, encode_row_payload
 from .storage import BPlusTreeBackend, KeyValueBackend, LsmTreeBackend
 from .subqueries import contains_subquery, expand_statement, statement_tables
@@ -924,15 +932,13 @@ class DatabaseEngine:
     def _visible_table_rows(
         self, txn_id: TransactionId, table: str
     ) -> list[tuple[int, dict[str, ColumnValue]]]:
-        prefix = f"{table}{ROW_ID_SEPARATOR}"
+        start, end = RowId(table_row_prefix(table)), RowId(table_row_prefix_end(table))
         try:
-            visible = self._mvcc.scan(txn_id)
+            visible = self._mvcc.scan_range(txn_id, start, end)
         except TransactionNotActiveError as exc:
             raise ProgrammingError(str(exc)) from exc
         return [
-            (split_row_id(row_id)[1], decode_row_payload(payload))
-            for row_id, payload in visible
-            if str(row_id).startswith(prefix)
+            (split_row_id(row_id)[1], decode_row_payload(payload)) for row_id, payload in visible
         ]
 
     def _check_unique_constraints(

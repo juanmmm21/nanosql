@@ -19,7 +19,7 @@ dependencies = [
     "write-ahead-log-recovery @ git+https://github.com/juanmmm21/write-ahead-log-recovery.git@feat/strata-roadmap",
     "bplus-tree-storage-engine @ git+https://github.com/juanmmm21/bplus-tree-storage-engine.git",
     "lsm-tree-engine @ git+https://github.com/juanmmm21/lsm-tree-engine.git",
-    "mvcc-transaction-manager @ git+https://github.com/juanmmm21/mvcc-transaction-manager.git",
+    "mvcc-transaction-manager @ git+https://github.com/juanmmm21/mvcc-transaction-manager.git@feat/strata-roadmap",
     "lock-manager-deadlock-detector @ git+https://github.com/juanmmm21/lock-manager-deadlock-detector.git",
     "sql-query-parser @ git+https://github.com/juanmmm21/sql-query-parser.git@feat/strata-roadmap",
     "cost-based-query-optimizer @ git+https://github.com/juanmmm21/cost-based-query-optimizer.git@feat/strata-roadmap",
