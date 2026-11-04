@@ -200,7 +200,7 @@ pip install -e ".[distributed,dev]"
 
 ```text
 $ nanosql mydata.db
-nanosql 0.1.0 — motor: btree
+nanosql 0.2.0 — motor: btree
 Escribe SQL terminado en ";", ".help" para ayuda, ".quit" para salir.
 nanosql> CREATE TABLE t (id INTEGER PRIMARY KEY, nombre VARCHAR(20));
 OK (0 filas afectadas, 0.3 ms)

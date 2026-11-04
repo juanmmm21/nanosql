@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nanosql"
-version = "0.1.0"
+version = "0.2.0"
 description = "An embeddable SQL engine with CLI/REPL and a Python driver, assembling from-scratch storage, transaction, query, and consensus engines."
 readme = "README.md"
 requires-python = ">=3.11"
