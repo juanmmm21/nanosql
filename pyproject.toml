@@ -32,7 +32,10 @@ distributed = [
     "raft-replication-log @ git+https://github.com/juanmmm21/raft-replication-log.git",
     "distributed-query-router @ git+https://github.com/juanmmm21/distributed-query-router.git",
 ]
-dev = ["pytest>=8.0", "mypy>=1.14", "ruff>=0.6"]
+# Clientes reales de PostgreSQL para los tests del servidor de protocolo
+# (`nanosql serve`); psql se toma del sistema si existe.
+pgclients = ["psycopg[binary]>=3.1", "sqlalchemy>=2.0"]
+dev = ["pytest>=8.0", "mypy>=1.14", "ruff>=0.6", "psycopg[binary]>=3.1", "sqlalchemy>=2.0"]
 
 [project.urls]
 Repository = "https://github.com/juanmmm21/nanosql"
