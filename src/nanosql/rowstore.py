@@ -249,21 +249,22 @@ class DurableRowStore:
             live_rows=previous.live_rows + (1 if alive else 0),
         )
 
-    def latest_live_payloads(self, table: str) -> Iterator[bytes]:
-        """Payload de la versión confirmada más reciente de cada fila viva
-        de `table` (las filas cuyo último estado es un tombstone se
-        omiten). Misma vista que `live_row_count`: la entrada de `ANALYZE`."""
+    def latest_live_rows(self, table: str) -> Iterator[tuple[int, bytes]]:
+        """`(rowid, payload)` de la versión confirmada más reciente de cada
+        fila viva de `table` (las filas cuyo último estado es un tombstone
+        se omiten). Misma vista que `live_row_count`: la entrada de
+        `ANALYZE` y del índice de claves únicas confirmadas."""
         prefix = table_row_prefix(table).encode("utf-8")
         current_row: RowId | None = None
         current_value: bytes | None = None
         for key, data in self._backend.scan(prefix, _prefix_end(prefix)):
             row_id, seq = _decode_key(key)
-            if row_id != current_row and current_value is not None:
-                yield current_value
+            if row_id != current_row and current_row is not None and current_value is not None:
+                yield split_row_id(current_row)[1], current_value
             current_row = row_id
             current_value = _decode_version(row_id, seq, data).value
-        if current_value is not None:
-            yield current_value
+        if current_row is not None and current_value is not None:
+            yield split_row_id(current_row)[1], current_value
 
     def live_row_count(self, table: str) -> int:
         """Filas de `table` cuya versión más reciente confirmada no es un

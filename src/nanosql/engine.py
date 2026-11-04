@@ -96,6 +96,7 @@ from .translate import (
     physical_plan_to_executor,
     select_to_optimizer,
 )
+from .uniqueness import UniqueKeyIndex, key_of
 
 MEMORY_PATH = ":memory:"
 CATALOG_FILENAME = "catalog.json"
@@ -300,6 +301,13 @@ class DatabaseEngine:
         self._next_rowid: dict[str, int] = {}
         self._live_counts: dict[str, int] = {}
         self._table_stats: dict[str, TableStatistics] = {}
+        # Claves únicas: las del último estado confirmado por tabla y, por
+        # transacción, las de su snapshot más sus propias escrituras (ver
+        # uniqueness.py). `_commit_generation` invalida las segundas cuando
+        # otra transacción confirma (READ COMMITTED ve el cambio).
+        self._committed_unique: dict[str, UniqueKeyIndex] = {}
+        self._txn_unique: dict[TransactionId, dict[str, tuple[int, UniqueKeyIndex]]] = {}
+        self._commit_generation = 0
         self._txn_written_rows: dict[TransactionId, dict[str, set[int]]] = {}
         self._closed = False
 
@@ -431,8 +439,9 @@ class DatabaseEngine:
             with self._lock:
                 self._ensure_open()
                 written = self._txn_written_rows.pop(txn_id, {})
+                self._txn_unique.pop(txn_id, None)
                 try:
-                    self._validate_unique_at_commit(txn_id, written)
+                    committed_rows = self._validate_unique_at_commit(txn_id, written)
                 except IntegrityError:
                     # La transacción no puede confirmarse tal cual; se
                     # aborta (mismo contrato que un conflicto de escritura:
@@ -459,9 +468,12 @@ class DatabaseEngine:
                     self._row_store.end_logged_batch()
                 if wal_txn is not None and self._durability is not None:
                     self._durability.commit(wal_txn)
+                for table_name, rowid, row in committed_rows:
+                    self._committed_unique[table_name].replace(rowid, row)
                 for table in written:
                     self._live_counts.pop(table, None)
                 if written:
+                    self._commit_generation += 1
                     self._commits_since_gc += 1
                     self._commits_since_checkpoint += 1
                     self._maybe_run_maintenance()
@@ -470,18 +482,23 @@ class DatabaseEngine:
 
     def _validate_unique_at_commit(
         self, txn_id: TransactionId, written: dict[str, set[int]]
-    ) -> None:
+    ) -> list[tuple[str, int, dict[str, ColumnValue] | None]]:
         """Revalidación de unicidad contra lo ÚLTIMO confirmado, en commit.
 
         Las comprobaciones por sentencia validan contra el snapshot de la
         propia transacción, que no ve lo que otra transacción concurrente
         confirmó después: dos transacciones podían insertar el mismo valor
         "único" sin verse. Como el lock de ejecución del engine serializa
-        los commits, revalidar aquí las filas escritas contra una vista
-        READ_COMMITTED fresca (excluyendo las propias filas escritas, que
-        esta transacción va a sobrescribir o borrar) cierra ese hueco por
+        los commits, revalidar aquí las filas escritas contra el último
+        estado confirmado (excluyendo las propias filas escritas, que esta
+        transacción va a sobrescribir o borrar) cierra ese hueco por
         completo dentro del proceso.
+
+        El estado confirmado vive en un `UniqueKeyIndex` por tabla: se
+        construye una vez y el llamador le aplica, tras un commit con
+        éxito, las filas que devuelve este método (nuevo valor o `None`).
         """
+        committed_rows: list[tuple[str, int, dict[str, ColumnValue] | None]] = []
         for table_name, rowids in written.items():
             table = self._catalog.tables.get(table_name)
             if table is None:
@@ -492,36 +509,38 @@ class DatabaseEngine:
             mine: list[dict[str, ColumnValue]] = []
             for rowid in rowids:
                 payload = self._mvcc.get(txn_id, make_row_id(table_name, rowid))
-                if payload is not None:  # los borrados no pueden crear duplicados
-                    mine.append(decode_row_payload(payload))
-            if not mine:
-                continue
-            probe = self._mvcc.begin(IsolationLevel.READ_COMMITTED)
-            try:
-                committed = [
-                    row
-                    for rowid, row in self._visible_table_rows(probe, table_name)
-                    if rowid not in rowids
-                ]
-            finally:
-                self._mvcc.abort(probe)
+                row = None if payload is None else decode_row_payload(payload)
+                committed_rows.append((table_name, rowid, row))
+                if row is not None:  # los borrados no pueden crear duplicados
+                    mine.append(row)
+            index = self._committed_unique_index(table_name, constraints)
             for constraint in constraints:
-                existing: set[tuple[ColumnValue, ...]] = set()
-                for row in committed:
-                    committed_key = tuple(row.get(c) for c in constraint)
-                    if None not in committed_key:
-                        existing.add(committed_key)
                 for row in mine:
-                    key = tuple(row.get(c) for c in constraint)
-                    if None in key:
+                    key = key_of(row, constraint)
+                    if key is None:
                         continue
-                    if key in existing:
+                    owner = index.owner(constraint, key)
+                    if owner is not None and owner not in rowids:
                         raise IntegrityError(
                             f"commit rechazado: otra transacción confirmó antes el valor "
                             f"{key!r} para la restricción única "
                             f"({', '.join(constraint)}) de '{table_name}'",
                             sqlstate="23505",
                         )
+        return committed_rows
+
+    def _committed_unique_index(
+        self, table: str, constraints: list[tuple[str, ...]]
+    ) -> UniqueKeyIndex:
+        index = self._committed_unique.get(table)
+        if index is None or index.constraints != tuple(constraints):
+            rows = (
+                (rowid, decode_row_payload(payload))
+                for rowid, payload in self._row_store.latest_live_rows(table)
+            )
+            index = UniqueKeyIndex.build(constraints, rows)
+            self._committed_unique[table] = index
+        return index
 
     def transaction_active(self, txn_id: TransactionId) -> bool:
         try:
@@ -533,6 +552,7 @@ class DatabaseEngine:
         with self._lock:
             self._ensure_open()
             self._txn_written_rows.pop(txn_id, None)
+            self._txn_unique.pop(txn_id, None)
             try:
                 self._mvcc.abort(txn_id)
             except TransactionNotActiveError:
@@ -797,7 +817,7 @@ class DatabaseEngine:
 
     def _analyze_table(self, table: str) -> TableStatistics:
         columns = self._catalog.table(table).column_names()
-        rows = (decode_row_payload(p) for p in self._row_store.latest_live_payloads(table))
+        rows = (decode_row_payload(p) for _, p in self._row_store.latest_live_rows(table))
         stats = analyze(columns, rows)
         self._table_stats[table] = stats
         self._live_counts[table] = stats.row_count
@@ -886,6 +906,16 @@ class DatabaseEngine:
             self._mvcc.put(txn_id, make_row_id(table, rowid), encode_row_payload(row))
         except TransactionNotActiveError as exc:
             raise ProgrammingError(str(exc)) from exc
+        self._note_unique_write(txn_id, table, rowid, row)
+
+    def _note_unique_write(
+        self, txn_id: TransactionId, table: str, rowid: int, row: dict[str, ColumnValue] | None
+    ) -> None:
+        """Mantiene el índice de claves únicas de la transacción (si ya lo
+        construyó) al día con su propia escritura; `row=None` es un borrado."""
+        entry = self._txn_unique.get(txn_id, {}).get(table)
+        if entry is not None:
+            entry[1].replace(rowid, row)
 
     def _coerce_value(
         self, table_name: str, column: ColumnSchema, value: ColumnValue
@@ -977,37 +1007,44 @@ class DatabaseEngine:
         *,
         exclude_rowids: set[int],
     ) -> None:
-        """Unicidad evaluada contra el snapshot de la propia transacción.
-
-        Limitación honesta (documentada en el README): dos transacciones
-        concurrentes pueden insertar el mismo valor "único" sin verse — el
-        first-committer-wins de MVCC protege filas, no valores de columna.
-        Cerrar ese hueco requiere validación de unicidad en el commit del
-        gestor MVCC (mejora propuesta al subproyecto, no parcheada aquí).
-        """
+        """Unicidad evaluada contra el snapshot de la propia transacción
+        (más sus escrituras), vía su `UniqueKeyIndex`: coste proporcional a
+        las filas candidatas, no a la tabla. Lo que confirmen otras
+        transacciones después del snapshot lo atrapa la revalidación del
+        commit (`_validate_unique_at_commit`)."""
         constraints = self._unique_constraints(table)
         if not constraints:
             return
-        existing = self._visible_table_rows(txn_id, table.name)
+        index = self._txn_unique_index(txn_id, table.name, constraints)
         for constraint in constraints:
             seen: set[tuple[ColumnValue, ...]] = set()
-            for rowid, row in existing:
-                if rowid in exclude_rowids:
-                    continue
-                key = tuple(row.get(col) for col in constraint)
-                if None not in key:
-                    seen.add(key)
             for row in candidate_rows:
-                key = tuple(row.get(col) for col in constraint)
-                if None in key:
+                key = key_of(row, constraint)
+                if key is None:
                     continue  # los NULL nunca chocan entre sí, como en SQL
-                if key in seen:
+                owner = index.owner(constraint, key)
+                if (owner is not None and owner not in exclude_rowids) or key in seen:
                     raise IntegrityError(
                         f"valor duplicado {key!r} para la restricción única "
                         f"({', '.join(constraint)}) de '{table.name}'",
                         sqlstate="23505",
                     )
                 seen.add(key)
+
+    def _txn_unique_index(
+        self, txn_id: TransactionId, table: str, constraints: list[tuple[str, ...]]
+    ) -> UniqueKeyIndex:
+        per_txn = self._txn_unique.setdefault(txn_id, {})
+        entry = per_txn.get(table)
+        if (
+            entry is None
+            or entry[0] != self._commit_generation
+            or entry[1].constraints != tuple(constraints)
+        ):
+            index = UniqueKeyIndex.build(constraints, self._visible_table_rows(txn_id, table))
+            per_txn[table] = (self._commit_generation, index)
+            return index
+        return entry[1]
 
     # -- UPDATE / DELETE --------------------------------------------------
 
@@ -1105,6 +1142,7 @@ class DatabaseEngine:
                 self._mvcc.delete(txn_id, make_row_id(stmt.table, rowid))
             except TransactionNotActiveError as exc:
                 raise ProgrammingError(str(exc)) from exc
+            self._note_unique_write(txn_id, stmt.table, rowid, None)
             self._record_write(txn_id, stmt.table, rowid)
         return StatementResult(kind="delete", rowcount=len(matched))
 
@@ -1172,6 +1210,7 @@ class DatabaseEngine:
         self._next_rowid.setdefault(stmt.table, 1)
         self._live_counts[stmt.table] = 0
         self._table_stats.pop(stmt.table, None)
+        self._committed_unique.pop(stmt.table, None)
         self._persist_catalog()
         return StatementResult(kind="create_table", rowcount=0)
 
@@ -1294,6 +1333,7 @@ class DatabaseEngine:
         try:
             for rowid, _ in self._visible_table_rows(txn, stmt.table):
                 self._mvcc.delete(txn, make_row_id(stmt.table, rowid))
+                self._note_unique_write(txn, stmt.table, rowid, None)
                 self._record_write(txn, stmt.table, rowid)
         except BaseException:
             self.rollback(txn)
@@ -1302,6 +1342,7 @@ class DatabaseEngine:
         self._catalog.drop_table(stmt.table)
         self._live_counts.pop(stmt.table, None)
         self._table_stats.pop(stmt.table, None)
+        self._committed_unique.pop(stmt.table, None)
         self._persist_catalog()
         return StatementResult(kind="drop_table", rowcount=0)
 
