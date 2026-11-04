@@ -81,6 +81,7 @@ def _load(conn: nanosql.Connection, scale: float) -> None:
         conn.commit()
     for statement in INDEXES:
         conn.execute(statement)
+    conn.execute("ANALYZE")
 
 
 def main() -> int:

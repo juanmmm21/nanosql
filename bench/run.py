@@ -39,6 +39,9 @@ def _load(execute: Any, many: Any, scale: float) -> float:
         many(name, columns, list(rows))
     for statement in INDEXES:
         execute(statement)
+    # Estadísticas del optimizador en los tres motores (los tres lo admiten);
+    # cuenta como parte de la carga.
+    execute("ANALYZE")
     return time.perf_counter() - started
 
 
