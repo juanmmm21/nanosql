@@ -94,9 +94,13 @@ class BPlusTreeBackend:
     ) -> None:
         try:
             device = InMemoryPageDevice() if path is None else FilePageDevice(path)
+            # En disco el archivo debe pasar de un checkpoint completo al
+            # siguiente: el WAL de nanosql es lógico (re-aplica puts) y no
+            # puede rehacer sobre un árbol que un kill -9 dejó a medio split.
+            # crash_consistent = no-steal + flush atómico con diario.
             pool = BufferPool(
                 device,
-                BufferPoolConfig(capacity=buffer_pool_pages),
+                BufferPoolConfig(capacity=buffer_pool_pages, crash_consistent=path is not None),
                 LruReplacementPolicy(),
             )
             self._tree = BPlusTree(pool)

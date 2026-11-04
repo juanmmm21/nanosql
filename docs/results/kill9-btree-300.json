@@ -1,8 +1,8 @@
 {
   "backend": "btree",
   "kills": 300,
-  "acknowledged_batches": 1253,
-  "recovered_batches": 1254,
+  "acknowledged_batches": 1430,
+  "recovered_batches": 1430,
   "violations": [],
-  "seconds": 139.1
+  "seconds": 145.7
 }

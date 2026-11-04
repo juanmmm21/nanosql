@@ -492,16 +492,31 @@ Two layers of evidence, both measured in this session:
 
 | backend | kills | batches acknowledged | batches recovered | violations | time |
 |---|---:|---:|---:|---:|---:|
-| btree | 300 | 1,253 | 1,254 | 0 | 139 s |
-| lsm | 300 | 1,066 | 1,066 | 0 | 140 s |
+| btree | 300 | 1,430 | 1,430 | 0 | 146 s |
+| lsm | 300 | 997 | 997 | 0 | 151 s |
 
-(One more batch recovered than acknowledged means a commit that reached
-disk but was killed before printing its `ack` — allowed.) The same
+(A run can recover one more batch than it acknowledged: a commit that
+reached disk but was killed before printing its `ack` — allowed.) The same
 campaign against the previous `write-ahead-log-recovery` release (100
 kills per backend) also passed: `SIGKILL` does not lose the operating
 system's page cache, so it cannot tear writes; the WAL bugs above need a
 power-loss-style fault, which is what the fault-injection layer models.
 Reports in `docs/results/kill9-*.json`.
+
+* **A bug the random campaign missed, and CI found.** Random kills almost
+  never land inside a checkpoint, the only moment the B+Tree writes its
+  dirty pages, one after another. CI's run of `test_kill9.py` did, and the
+  database no longer opened (`page_type desconocido: 0`): a parent already
+  on disk pointed to a page created by a split that was still the zeros
+  `allocate_page` writes. A logical WAL cannot replay `put`s through a tree
+  like that. `bplus-tree-storage-engine` now has a crash-consistent mode —
+  eviction never writes dirty pages, and `flush()` is atomic through a
+  double-write journal — and nanosql opens its on-disk B+Tree with it.
+  `tests/test_kill_during_flush.py` now kills the writer deterministically
+  before *every* in-place page write of a checkpoint (31 points) and
+  requires exactly the committed rows after reopening: without the fix 30
+  of the 31 left a database that did not open; with it, all 31 pass. The
+  campaign above was re-run after the fix.
 
 ## PostgreSQL wire protocol (`nanosql serve`)
 
@@ -698,7 +713,7 @@ python -m nanosql.sqllogictest tests/sqllogictest/corpus/*.test.gz \
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -e ".[distributed,dev]"
-.venv/bin/pytest              # 264 tests (psql/psycopg/SQLAlchemy ones skip if absent)
+.venv/bin/pytest              # 265 tests (psql/psycopg/SQLAlchemy ones skip if absent)
 .venv/bin/ruff check . && .venv/bin/ruff format --check .
 .venv/bin/mypy --strict src/
 ```
