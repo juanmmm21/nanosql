@@ -434,7 +434,7 @@ class Connection:
         except UnsupportedFeatureError as exc:
             raise NotSupportedError(_format_syntax_error(exc, to_parse)) from exc
         except SqlSyntaxError as exc:
-            raise ProgrammingError(_format_syntax_error(exc, to_parse)) from exc
+            raise ProgrammingError(_format_syntax_error(exc, to_parse), sqlstate="42601") from exc
         except SqlParserError as exc:
             raise ProgrammingError(str(exc)) from exc
         statement = bind_statement(statement, params)
@@ -451,7 +451,7 @@ class Connection:
         except UnsupportedFeatureError as exc:
             raise NotSupportedError(_format_syntax_error(exc, script)) from exc
         except SqlSyntaxError as exc:
-            raise ProgrammingError(_format_syntax_error(exc, script)) from exc
+            raise ProgrammingError(_format_syntax_error(exc, script), sqlstate="42601") from exc
         except SqlParserError as exc:
             raise ProgrammingError(str(exc)) from exc
         # Nota: parse_many no puede contener BEGIN/COMMIT (no son gramática

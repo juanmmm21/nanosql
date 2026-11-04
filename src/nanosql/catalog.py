@@ -80,7 +80,9 @@ class TableSchema:
         for col in self.columns:
             if col.name == name:
                 return col
-        raise ProgrammingError(f"la columna '{name}' no existe en la tabla '{self.name}'")
+        raise ProgrammingError(
+            f"la columna '{name}' no existe en la tabla '{self.name}'", sqlstate="42703"
+        )
 
     def column_names(self) -> tuple[str, ...]:
         return tuple(col.name for col in self.columns)
@@ -102,16 +104,16 @@ class Catalog:
         try:
             return self.tables[name]
         except KeyError as exc:
-            raise ProgrammingError(f"la tabla '{name}' no existe") from exc
+            raise ProgrammingError(f"la tabla '{name}' no existe", sqlstate="42P01") from exc
 
     def add_table(self, table: TableSchema) -> None:
         if table.name in self.tables:
-            raise ProgrammingError(f"la tabla '{table.name}' ya existe")
+            raise ProgrammingError(f"la tabla '{table.name}' ya existe", sqlstate="42P07")
         self.tables[table.name] = table
 
     def add_index(self, index: IndexSchema) -> None:
         if index.name in self.indexes:
-            raise ProgrammingError(f"el índice '{index.name}' ya existe")
+            raise ProgrammingError(f"el índice '{index.name}' ya existe", sqlstate="42P07")
         table = self.table(index.table)
         for column in index.columns:
             if not table.has_column(column):

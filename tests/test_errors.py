@@ -160,3 +160,39 @@ class TestDataAndIntegrityErrors:
             with pytest.raises(NanosqlError):
                 conn.execute(bad)
         assert conn.execute("SELECT COUNT(*) FROM t").fetchall() == [(1,)]
+
+
+class TestSqlstate:
+    """Cada error lleva un SQLSTATE: el de su clase o uno específico."""
+
+    def test_class_defaults(self) -> None:
+        assert nanosql.ProgrammingError("x").sqlstate == "42000"
+        assert nanosql.NotSupportedError("x").sqlstate == "0A000"
+        assert nanosql.TransactionConflictError("x").sqlstate == "40001"
+        assert nanosql.ProgrammingError("x", sqlstate="42P01").sqlstate == "42P01"
+
+    def test_specific_codes_from_the_engine(self) -> None:
+        conn = nanosql.connect(":memory:", autocommit=True)
+        try:
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            cases = {
+                "SELECT * FROM nope": "42P01",
+                "SELECT zz FROM t": "42703",
+                "SELEC 1": "42601",
+                "CREATE TABLE t (id INTEGER)": "42P07",
+                "INSERT INTO t (id, v) VALUES (1, 'x')": "42804",
+                "INSERT INTO t (v) VALUES (1)": "23502",
+            }
+            for sql, code in cases.items():
+                with pytest.raises(nanosql.DatabaseError) as info:
+                    conn.execute(sql)
+                assert info.value.sqlstate == code, sql
+            conn.execute("INSERT INTO t (id, v) VALUES (1, 0)")
+            with pytest.raises(nanosql.IntegrityError) as dup:
+                conn.execute("INSERT INTO t (id, v) VALUES (1, 0)")
+            assert dup.value.sqlstate == "23505"
+            with pytest.raises(nanosql.DataError) as div:
+                conn.execute("SELECT id / v FROM t")
+            assert div.value.sqlstate == "22012"
+        finally:
+            conn.close()

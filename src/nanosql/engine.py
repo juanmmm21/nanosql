@@ -234,11 +234,11 @@ def evaluate_constant(expr: pm.Expression) -> ColumnValue:
             return left * right
         if op is pm.BinaryOperator.DIV:
             if right == 0:
-                raise DataError("división por cero en expresión constante")
+                raise DataError("división por cero en expresión constante", sqlstate="22012")
             return left / right
         if op is pm.BinaryOperator.MOD:
             if right == 0:
-                raise DataError("módulo por cero en expresión constante")
+                raise DataError("módulo por cero en expresión constante", sqlstate="22012")
             return left % right
         raise ProgrammingError(
             f"el operador {op.name} no está permitido en una expresión constante"
@@ -490,7 +490,8 @@ class DatabaseEngine:
                         raise IntegrityError(
                             f"commit rechazado: otra transacción confirmó antes el valor "
                             f"{key!r} para la restricción única "
-                            f"({', '.join(constraint)}) de '{table_name}'"
+                            f"({', '.join(constraint)}) de '{table_name}'",
+                            sqlstate="23505",
                         )
 
     def transaction_active(self, txn_id: TransactionId) -> bool:
@@ -608,12 +609,14 @@ class DatabaseEngine:
             except DeadlockAbortError as exc:
                 self.rollback(txn_id)
                 raise TransactionConflictError(
-                    f"transacción abortada como víctima de deadlock sobre '{table}'"
+                    f"transacción abortada como víctima de deadlock sobre '{table}'",
+                    sqlstate="40P01",
                 ) from exc
             except LockTimeoutError as exc:
                 raise OperationalError(
                     f"timeout esperando el lock de la tabla '{table}' "
-                    "(¿DDL concurrente con una transacción larga?)"
+                    "(¿DDL concurrente con una transacción larga?)",
+                    sqlstate="55P03",
                 ) from exc
 
     # -- SELECT ---------------------------------------------------------
@@ -643,11 +646,13 @@ class DatabaseEngine:
         try:
             return optimize(opt_select, stats_catalog)
         except opt_errors.UnresolvedColumnError as exc:
-            raise ProgrammingError(f"columna no resuelta: {exc}") from exc
+            raise ProgrammingError(f"columna no resuelta: {exc}", sqlstate="42703") from exc
         except opt_errors.UnsupportedQueryError as exc:
             raise NotSupportedError(f"consulta no soportada por el optimizador: {exc}") from exc
         except opt_errors.MissingStatisticsError as exc:
-            raise ProgrammingError(f"tabla desconocida para el optimizador: {exc}") from exc
+            raise ProgrammingError(
+                f"tabla desconocida para el optimizador: {exc}", sqlstate="42P01"
+            ) from exc
         except opt_errors.OptimizerError as exc:
             raise InternalError(f"el optimizador falló: {exc}") from exc
 
@@ -693,9 +698,11 @@ class DatabaseEngine:
         try:
             return collect(plan, source)
         except vec_errors.DivisionByZeroError as exc:
-            raise DataError(str(exc)) from exc
+            raise DataError(str(exc), sqlstate="22012") from exc
         except vec_errors.UnresolvedColumnError as exc:
-            raise ProgrammingError(f"columna no resuelta en ejecución: {exc}") from exc
+            raise ProgrammingError(
+                f"columna no resuelta en ejecución: {exc}", sqlstate="42703"
+            ) from exc
         except (
             vec_errors.UnsupportedExpressionError,
             vec_errors.UnsupportedOperatorError,
@@ -807,7 +814,10 @@ class DatabaseEngine:
 
         if value is None:
             if column.not_null or column.primary_key:
-                raise IntegrityError(f"la columna '{column.name}' de '{table_name}' no admite NULL")
+                raise IntegrityError(
+                    f"la columna '{column.name}' de '{table_name}' no admite NULL",
+                    sqlstate="23502",
+                )
             return None
         # bool antes que int: en Python bool es subclase de int y colaría
         # como entero en una columna INTEGER.
@@ -815,7 +825,8 @@ class DatabaseEngine:
             if column.column_type is not ColumnType.BOOLEAN:
                 raise DataError(
                     f"valor booleano para la columna {column.column_type.name} "
-                    f"'{column.name}' de '{table_name}'"
+                    f"'{column.name}' de '{table_name}'",
+                    sqlstate="42804",
                 )
             return value
         if isinstance(value, int):
@@ -825,23 +836,26 @@ class DatabaseEngine:
                 return float(value)
             raise DataError(
                 f"valor entero para la columna {column.column_type.name} "
-                f"'{column.name}' de '{table_name}'"
+                f"'{column.name}' de '{table_name}'",
+                sqlstate="42804",
             )
         if isinstance(value, float):
             if column.column_type is ColumnType.FLOAT:
                 return value
             raise DataError(
                 f"valor de coma flotante para la columna {column.column_type.name} "
-                f"'{column.name}' de '{table_name}' (no hay truncado implícito)"
+                f"'{column.name}' de '{table_name}' (no hay truncado implícito)",
+                sqlstate="42804",
             )
         if isinstance(value, str):
             if column.column_type is ColumnType.STRING:
                 return value
             raise DataError(
                 f"valor de texto para la columna {column.column_type.name} "
-                f"'{column.name}' de '{table_name}'"
+                f"'{column.name}' de '{table_name}'",
+                sqlstate="42804",
             )
-        raise DataError(f"tipo de valor no soportado: {type(value).__name__}")
+        raise DataError(f"tipo de valor no soportado: {type(value).__name__}", sqlstate="42804")
 
     # -- restricciones de unicidad ---------------------------------------
 
@@ -912,7 +926,8 @@ class DatabaseEngine:
                 if key in seen:
                     raise IntegrityError(
                         f"valor duplicado {key!r} para la restricción única "
-                        f"({', '.join(constraint)}) de '{table.name}'"
+                        f"({', '.join(constraint)}) de '{table.name}'",
+                        sqlstate="23505",
                     )
                 seen.add(key)
 
@@ -1021,7 +1036,7 @@ class DatabaseEngine:
         if stmt.table in self._catalog.tables:
             if stmt.if_not_exists:
                 return StatementResult(kind="create_table", rowcount=0)
-            raise ProgrammingError(f"la tabla '{stmt.table}' ya existe")
+            raise ProgrammingError(f"la tabla '{stmt.table}' ya existe", sqlstate="42P07")
 
         columns: list[ColumnSchema] = []
         seen_names: set[str] = set()
@@ -1084,7 +1099,7 @@ class DatabaseEngine:
         if stmt.index_name in self._catalog.indexes:
             if stmt.if_not_exists:
                 return StatementResult(kind="create_index", rowcount=0)
-            raise ProgrammingError(f"el índice '{stmt.index_name}' ya existe")
+            raise ProgrammingError(f"el índice '{stmt.index_name}' ya existe", sqlstate="42P07")
         table = self._catalog.table(stmt.table)
         if stmt.unique:
             # Un índice UNIQUE sobre datos existentes sólo es válido si esos
@@ -1099,7 +1114,8 @@ class DatabaseEngine:
                 if key in seen:
                     raise IntegrityError(
                         f"no se puede crear el índice único '{stmt.index_name}': "
-                        f"valor duplicado {key!r} en los datos existentes"
+                        f"valor duplicado {key!r} en los datos existentes",
+                        sqlstate="23505",
                     )
                 seen.add(key)
         self._catalog.add_index(
