@@ -1,0 +1,26 @@
+{
+  "nodes": 5,
+  "duration_seconds": 630.1,
+  "seed": 202,
+  "operations": 155431,
+  "ok": 155431,
+  "indeterminate": 0,
+  "failed": 0,
+  "throughput_ops_per_s": 246.7,
+  "latency_ms": {
+    "p50": 18.2,
+    "p99": 54.4,
+    "max": 4087.6
+  },
+  "faults": {
+    "pause": 26,
+    "partition": 30,
+    "partition-leader": 23,
+    "kill-leader": 19
+  },
+  "linearizable": true,
+  "violations": [],
+  "undecided": [],
+  "keys_checked": 8,
+  "check_seconds": 0.92
+}

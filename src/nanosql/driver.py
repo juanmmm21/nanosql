@@ -25,6 +25,7 @@ from types import TracebackType
 import sql_query_parser.models as pm
 from mvcc_transaction_manager import IsolationLevel, TransactionId
 from sql_query_parser import (
+    Parser,
     SqlParserError,
     SqlSyntaxError,
     UnsupportedFeatureError,
@@ -65,16 +66,17 @@ def _format_syntax_error(exc: SqlSyntaxError, sql: str) -> str:
     return _error_formatter.format(exc, sql)
 
 
-def classify_transaction_control(sql: str) -> str | None:
+def classify_transaction_control(sql: str, tokens: list[pm.Token] | None = None) -> str | None:
     """Devuelve "begin"/"commit"/"rollback" si `sql` es una sentencia de
     control de transacciones, `None` si debe ir al parser. Reutiliza el
     lexer real del ecosistema en vez de expresiones regulares: comentarios,
     mayúsculas y espaciado quedan resueltos por el mismo código que el
-    resto del SQL."""
-    try:
-        tokens = tokenize(sql)
-    except SqlParserError:
-        return None  # que el error lo produzca (bien formateado) el parser
+    resto del SQL. `tokens`, si se pasan, son los de `sql` ya lexados."""
+    if tokens is None:
+        try:
+            tokens = tokenize(sql)
+        except SqlParserError:
+            return None  # que el error lo produzca (bien formateado) el parser
     meaningful = [t for t in tokens if t.type not in (pm.TokenType.EOF, pm.TokenType.SEMICOLON)]
     if not meaningful or meaningful[0].type is not pm.TokenType.IDENTIFIER:
         return None
@@ -93,15 +95,16 @@ def classify_transaction_control(sql: str) -> str | None:
     return head.lower()
 
 
-def strip_explain_prefix(sql: str) -> str | None:
+def strip_explain_prefix(sql: str, tokens: list[pm.Token] | None = None) -> str | None:
     """Si `sql` empieza por `EXPLAIN`, devuelve el resto de la sentencia;
     si no, `None`. Igual que el control de transacciones, EXPLAIN es una
     orden del driver (no gramática del parser), detectada con el lexer real
     para que comentarios y mayúsculas no importen."""
-    try:
-        tokens = tokenize(sql)
-    except SqlParserError:
-        return None
+    if tokens is None:
+        try:
+            tokens = tokenize(sql)
+        except SqlParserError:
+            return None
     meaningful = [t for t in tokens if t.type is not pm.TokenType.EOF]
     if (
         len(meaningful) < 2
@@ -328,6 +331,8 @@ class Connection:
         registry_key: str | None,
         isolation: IsolationLevel,
         autocommit: bool,
+        *,
+        owns_engine: bool = True,
     ) -> None:
         self._engine: DatabaseEngine | None = engine
         self._registry_key = registry_key
@@ -335,6 +340,7 @@ class Connection:
         self._autocommit = autocommit
         self._txn: TransactionId | None = None
         self._explicit_txn = False
+        self._owns_engine = owns_engine
 
     # -- estado ------------------------------------------------------------
 
@@ -360,6 +366,30 @@ class Connection:
     def cursor(self) -> Cursor:
         self._require_engine()
         return Cursor(self)
+
+    def sibling(
+        self, *, isolation_level: str | None = None, autocommit: bool = False
+    ) -> Connection:
+        """Otra conexión sobre el MISMO engine, con su propia transacción.
+
+        Es lo que usa el servidor de protocolo Postgres para dar a cada
+        sesión de red su conexión: funciona también para `:memory:` (que
+        `connect()` nunca comparte). La conexión hermana no es dueña del
+        engine — cerrarla no lo cierra; lo cierra la conexión original.
+        """
+        engine = self._require_engine()
+        isolation = parse_isolation_level(isolation_level) if isolation_level else self._isolation
+        return Connection(engine, None, isolation, autocommit, owns_engine=False)
+
+    def begin(self, isolation_level: str | None = None) -> None:
+        """`BEGIN` explícito con un nivel de aislamiento opcional para ESTA
+        transacción (el de la conexión no cambia)."""
+        engine = self._require_engine()
+        if self._txn is not None:
+            raise ProgrammingError("ya hay una transacción activa", sqlstate="25001")
+        isolation = parse_isolation_level(isolation_level) if isolation_level else self._isolation
+        self._txn = engine.begin_transaction(isolation)
+        self._explicit_txn = True
 
     def execute(self, sql: str, params: Sequence[ColumnValue] | None = None) -> Cursor:
         """Atajo DB-API: crea un cursor y ejecuta `sql` en él."""
@@ -391,7 +421,8 @@ class Connection:
                 self._txn = None
         finally:
             self._engine = None
-            _release_engine(self._registry_key, engine)
+            if self._owns_engine:
+                _release_engine(self._registry_key, engine)
 
     def __enter__(self) -> Connection:
         return self
@@ -422,19 +453,29 @@ class Connection:
         self, sql: str, params: Sequence[ColumnValue] | None = None
     ) -> StatementResult:
         engine = self._require_engine()
-        control = classify_transaction_control(sql)
+        # Una sola pasada del lexer por sentencia: la clasificación (BEGIN,
+        # EXPLAIN) y el parser comparten los tokens. Lexar tres veces cada
+        # INSERT grande era el 30 % del tiempo de una carga masiva.
+        try:
+            tokens: list[pm.Token] | None = tokenize(sql)
+        except SqlParserError:
+            tokens = None  # el parser reproduce el error, bien formateado
+        control = classify_transaction_control(sql, tokens)
         if control is not None:
             if params:
                 raise ProgrammingError(f"{control.upper()} no admite parámetros")
             return self._execute_transaction_control(engine, control)
-        explained = strip_explain_prefix(sql)
+        explained = strip_explain_prefix(sql, tokens)
         to_parse = explained if explained is not None else sql
         try:
-            statement = parse(to_parse)
+            if explained is None and tokens is not None:
+                statement = Parser(tokens).parse_single_statement()
+            else:
+                statement = parse(to_parse)
         except UnsupportedFeatureError as exc:
             raise NotSupportedError(_format_syntax_error(exc, to_parse)) from exc
         except SqlSyntaxError as exc:
-            raise ProgrammingError(_format_syntax_error(exc, to_parse)) from exc
+            raise ProgrammingError(_format_syntax_error(exc, to_parse), sqlstate="42601") from exc
         except SqlParserError as exc:
             raise ProgrammingError(str(exc)) from exc
         statement = bind_statement(statement, params)
@@ -451,7 +492,7 @@ class Connection:
         except UnsupportedFeatureError as exc:
             raise NotSupportedError(_format_syntax_error(exc, script)) from exc
         except SqlSyntaxError as exc:
-            raise ProgrammingError(_format_syntax_error(exc, script)) from exc
+            raise ProgrammingError(_format_syntax_error(exc, script), sqlstate="42601") from exc
         except SqlParserError as exc:
             raise ProgrammingError(str(exc)) from exc
         # Nota: parse_many no puede contener BEGIN/COMMIT (no son gramática
@@ -479,7 +520,14 @@ class Connection:
         return StatementResult(kind="rollback", rowcount=0)
 
     def _execute_parsed(self, engine: DatabaseEngine, statement: pm.Statement) -> StatementResult:
-        if isinstance(statement, pm.CreateTableStatement | pm.CreateIndexStatement):
+        if isinstance(statement, pm.AnalyzeStatement):
+            # Lee sólo versiones confirmadas: no necesita transacción ni toca
+            # la del usuario (como en PostgreSQL, vale dentro de un BEGIN).
+            return engine.analyze(statement.table)
+        if isinstance(
+            statement,
+            pm.CreateTableStatement | pm.CreateIndexStatement | pm.DropTableStatement,
+        ):
             # DDL: confirma la transacción abierta (autocommit de DDL) y
             # ejecuta fuera de transacción de usuario.
             self.commit()

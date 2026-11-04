@@ -18,11 +18,24 @@ import sql_query_parser.models as pm
 from .catalog import ColumnValue
 from .errors import DataError, ProgrammingError
 
+_LITERAL_TYPES: dict[type, pm.LiteralType] = {
+    type(None): pm.LiteralType.NULL,
+    bool: pm.LiteralType.BOOLEAN,
+    int: pm.LiteralType.INTEGER,
+    float: pm.LiteralType.FLOAT,
+    str: pm.LiteralType.STRING,
+}
+
 
 def literal_for_value(value: ColumnValue) -> pm.Literal:
     """Literal tipado del AST del parser para un valor Python plano. Público
     dentro del paquete: lo comparte `subqueries.py` para materializar los
     resultados de una subconsulta como literales."""
+    # Tipo exacto primero (lo habitual: miles por INSERT masivo); las
+    # subclases siguen la cadena de abajo, con el mismo resultado.
+    literal_type = _LITERAL_TYPES.get(value.__class__)
+    if literal_type is not None:
+        return pm.Literal(value, literal_type)
     # bool antes que int: en Python bool es subclase de int.
     if value is None:
         return pm.Literal(None, pm.LiteralType.NULL)
@@ -169,6 +182,7 @@ def bind_statement(stmt: pm.Statement, params: Sequence[ColumnValue] | None) -> 
             table=stmt.table,
             columns=stmt.columns,
             rows=tuple(tuple(_bind_expr(e, binder) for e in row) for row in stmt.rows),
+            source=_bind_select(stmt.source, binder) if stmt.source is not None else None,
         )
     elif isinstance(stmt, pm.UpdateStatement):
         bound = pm.UpdateStatement(
@@ -181,7 +195,13 @@ def bind_statement(stmt: pm.Statement, params: Sequence[ColumnValue] | None) -> 
         )
     elif isinstance(stmt, pm.DeleteStatement):
         bound = pm.DeleteStatement(table=stmt.table, where=_optional(stmt.where, binder))
-    elif isinstance(stmt, pm.CreateTableStatement | pm.CreateIndexStatement):
+    elif isinstance(
+        stmt,
+        pm.CreateTableStatement
+        | pm.CreateIndexStatement
+        | pm.DropTableStatement
+        | pm.AnalyzeStatement,
+    ):
         if params:
             raise ProgrammingError("el DDL no admite parámetros '?'")
         bound = stmt

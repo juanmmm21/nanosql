@@ -25,8 +25,9 @@ tabla con el `RLock` en mano bloquearía el commit que debe liberarlo.
 
 from __future__ import annotations
 
+import math
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import cost_based_query_optimizer.errors as opt_errors
@@ -48,6 +49,7 @@ from lock_manager_deadlock_detector import (
 from mvcc_transaction_manager import (
     IsolationLevel,
     MVCCTransactionManager,
+    RowId,
     SerializationConflictError,
     TransactionId,
     TransactionNotActiveError,
@@ -77,8 +79,16 @@ from .errors import (
     ProgrammingError,
     TransactionConflictError,
 )
-from .rowstore import ROW_ID_SEPARATOR, DurableRowStore, make_row_id, split_row_id
+from .rowstore import (
+    ROW_ID_SEPARATOR,
+    DurableRowStore,
+    make_row_id,
+    split_row_id,
+    table_row_prefix,
+    table_row_prefix_end,
+)
 from .source import ROWID_COLUMN, MvccTableSource, decode_row_payload, encode_row_payload
+from .statistics import TableStatistics, analyze
 from .storage import BPlusTreeBackend, KeyValueBackend, LsmTreeBackend
 from .subqueries import contains_subquery, expand_statement, statement_tables
 from .translate import (
@@ -86,6 +96,7 @@ from .translate import (
     physical_plan_to_executor,
     select_to_optimizer,
 )
+from .uniqueness import UniqueKeyIndex, key_of
 
 MEMORY_PATH = ":memory:"
 CATALOG_FILENAME = "catalog.json"
@@ -234,12 +245,17 @@ def evaluate_constant(expr: pm.Expression) -> ColumnValue:
             return left * right
         if op is pm.BinaryOperator.DIV:
             if right == 0:
-                raise DataError("división por cero en expresión constante")
+                raise DataError("división por cero en expresión constante", sqlstate="22012")
+            if isinstance(left, int) and isinstance(right, int):
+                # Misma semántica que el ejecutor: división entera truncada.
+                return _truncated_quotient(left, right)
             return left / right
         if op is pm.BinaryOperator.MOD:
             if right == 0:
-                raise DataError("módulo por cero en expresión constante")
-            return left % right
+                raise DataError("módulo por cero en expresión constante", sqlstate="22012")
+            if isinstance(left, int) and isinstance(right, int):
+                return left - right * _truncated_quotient(left, right)
+            return math.fmod(left, right)
         raise ProgrammingError(
             f"el operador {op.name} no está permitido en una expresión constante"
         )
@@ -247,6 +263,12 @@ def evaluate_constant(expr: pm.Expression) -> ColumnValue:
         "sólo se admiten expresiones constantes en esta posición "
         f"(encontrado {type(expr).__name__})"
     )
+
+
+def _truncated_quotient(left: int, right: int) -> int:
+    """División entera truncada hacia cero (SQL), no la `//` de Python."""
+    quotient = abs(left) // abs(right)
+    return -quotient if (left < 0) != (right < 0) else quotient
 
 
 class DatabaseEngine:
@@ -278,6 +300,14 @@ class DatabaseEngine:
         self._commits_since_checkpoint = 0
         self._next_rowid: dict[str, int] = {}
         self._live_counts: dict[str, int] = {}
+        self._table_stats: dict[str, TableStatistics] = {}
+        # Claves únicas: las del último estado confirmado por tabla y, por
+        # transacción, las de su snapshot más sus propias escrituras (ver
+        # uniqueness.py). `_commit_generation` invalida las segundas cuando
+        # otra transacción confirma (READ COMMITTED ve el cambio).
+        self._committed_unique: dict[str, UniqueKeyIndex] = {}
+        self._txn_unique: dict[TransactionId, dict[str, tuple[int, UniqueKeyIndex]]] = {}
+        self._commit_generation = 0
         self._txn_written_rows: dict[TransactionId, dict[str, set[int]]] = {}
         self._closed = False
 
@@ -382,6 +412,13 @@ class DatabaseEngine:
     def catalog(self) -> Catalog:
         return self._catalog
 
+    def catalog_snapshot(self) -> Catalog:
+        """Copia consistente del catálogo, tomada bajo el lock del engine:
+        segura de recorrer desde otro hilo mientras el DDL sigue avanzando
+        (los esquemas son inmutables; sólo se copian los diccionarios)."""
+        with self._lock:
+            return Catalog(tables=dict(self._catalog.tables), indexes=dict(self._catalog.indexes))
+
     # ------------------------------------------------------------------
     # Transacciones
     # ------------------------------------------------------------------
@@ -402,8 +439,9 @@ class DatabaseEngine:
             with self._lock:
                 self._ensure_open()
                 written = self._txn_written_rows.pop(txn_id, {})
+                self._txn_unique.pop(txn_id, None)
                 try:
-                    self._validate_unique_at_commit(txn_id, written)
+                    committed_rows = self._validate_unique_at_commit(txn_id, written)
                 except IntegrityError:
                     # La transacción no puede confirmarse tal cual; se
                     # aborta (mismo contrato que un conflicto de escritura:
@@ -430,9 +468,12 @@ class DatabaseEngine:
                     self._row_store.end_logged_batch()
                 if wal_txn is not None and self._durability is not None:
                     self._durability.commit(wal_txn)
+                for table_name, rowid, row in committed_rows:
+                    self._committed_unique[table_name].replace(rowid, row)
                 for table in written:
                     self._live_counts.pop(table, None)
                 if written:
+                    self._commit_generation += 1
                     self._commits_since_gc += 1
                     self._commits_since_checkpoint += 1
                     self._maybe_run_maintenance()
@@ -441,18 +482,23 @@ class DatabaseEngine:
 
     def _validate_unique_at_commit(
         self, txn_id: TransactionId, written: dict[str, set[int]]
-    ) -> None:
+    ) -> list[tuple[str, int, dict[str, ColumnValue] | None]]:
         """Revalidación de unicidad contra lo ÚLTIMO confirmado, en commit.
 
         Las comprobaciones por sentencia validan contra el snapshot de la
         propia transacción, que no ve lo que otra transacción concurrente
         confirmó después: dos transacciones podían insertar el mismo valor
         "único" sin verse. Como el lock de ejecución del engine serializa
-        los commits, revalidar aquí las filas escritas contra una vista
-        READ_COMMITTED fresca (excluyendo las propias filas escritas, que
-        esta transacción va a sobrescribir o borrar) cierra ese hueco por
+        los commits, revalidar aquí las filas escritas contra el último
+        estado confirmado (excluyendo las propias filas escritas, que esta
+        transacción va a sobrescribir o borrar) cierra ese hueco por
         completo dentro del proceso.
+
+        El estado confirmado vive en un `UniqueKeyIndex` por tabla: se
+        construye una vez y el llamador le aplica, tras un commit con
+        éxito, las filas que devuelve este método (nuevo valor o `None`).
         """
+        committed_rows: list[tuple[str, int, dict[str, ColumnValue] | None]] = []
         for table_name, rowids in written.items():
             table = self._catalog.tables.get(table_name)
             if table is None:
@@ -463,35 +509,38 @@ class DatabaseEngine:
             mine: list[dict[str, ColumnValue]] = []
             for rowid in rowids:
                 payload = self._mvcc.get(txn_id, make_row_id(table_name, rowid))
-                if payload is not None:  # los borrados no pueden crear duplicados
-                    mine.append(decode_row_payload(payload))
-            if not mine:
-                continue
-            probe = self._mvcc.begin(IsolationLevel.READ_COMMITTED)
-            try:
-                committed = [
-                    row
-                    for rowid, row in self._visible_table_rows(probe, table_name)
-                    if rowid not in rowids
-                ]
-            finally:
-                self._mvcc.abort(probe)
+                row = None if payload is None else decode_row_payload(payload)
+                committed_rows.append((table_name, rowid, row))
+                if row is not None:  # los borrados no pueden crear duplicados
+                    mine.append(row)
+            index = self._committed_unique_index(table_name, constraints)
             for constraint in constraints:
-                existing: set[tuple[ColumnValue, ...]] = set()
-                for row in committed:
-                    committed_key = tuple(row.get(c) for c in constraint)
-                    if None not in committed_key:
-                        existing.add(committed_key)
                 for row in mine:
-                    key = tuple(row.get(c) for c in constraint)
-                    if None in key:
+                    key = key_of(row, constraint)
+                    if key is None:
                         continue
-                    if key in existing:
+                    owner = index.owner(constraint, key)
+                    if owner is not None and owner not in rowids:
                         raise IntegrityError(
                             f"commit rechazado: otra transacción confirmó antes el valor "
                             f"{key!r} para la restricción única "
-                            f"({', '.join(constraint)}) de '{table_name}'"
+                            f"({', '.join(constraint)}) de '{table_name}'",
+                            sqlstate="23505",
                         )
+        return committed_rows
+
+    def _committed_unique_index(
+        self, table: str, constraints: list[tuple[str, ...]]
+    ) -> UniqueKeyIndex:
+        index = self._committed_unique.get(table)
+        if index is None or index.constraints != tuple(constraints):
+            rows = (
+                (rowid, decode_row_payload(payload))
+                for rowid, payload in self._row_store.latest_live_rows(table)
+            )
+            index = UniqueKeyIndex.build(constraints, rows)
+            self._committed_unique[table] = index
+        return index
 
     def transaction_active(self, txn_id: TransactionId) -> bool:
         try:
@@ -503,6 +552,7 @@ class DatabaseEngine:
         with self._lock:
             self._ensure_open()
             self._txn_written_rows.pop(txn_id, None)
+            self._txn_unique.pop(txn_id, None)
             try:
                 self._mvcc.abort(txn_id)
             except TransactionNotActiveError:
@@ -592,6 +642,11 @@ class DatabaseEngine:
                 with self._lock:
                     self._ensure_open()
                     return self._execute_create_index(ddl_owner, stmt)
+            if isinstance(stmt, pm.DropTableStatement):
+                self._acquire_table_locks(ddl_owner, [stmt.table], LockMode.EXCLUSIVE)
+                with self._lock:
+                    self._ensure_open()
+                    return self._execute_drop_table(stmt)
             raise InternalError(f"DDL no enrutable: {type(stmt).__name__}")
         finally:
             self.rollback(ddl_owner)
@@ -608,12 +663,14 @@ class DatabaseEngine:
             except DeadlockAbortError as exc:
                 self.rollback(txn_id)
                 raise TransactionConflictError(
-                    f"transacción abortada como víctima de deadlock sobre '{table}'"
+                    f"transacción abortada como víctima de deadlock sobre '{table}'",
+                    sqlstate="40P01",
                 ) from exc
             except LockTimeoutError as exc:
                 raise OperationalError(
                     f"timeout esperando el lock de la tabla '{table}' "
-                    "(¿DDL concurrente con una transacción larga?)"
+                    "(¿DDL concurrente con una transacción larga?)",
+                    sqlstate="55P03",
                 ) from exc
 
     # -- SELECT ---------------------------------------------------------
@@ -622,7 +679,7 @@ class DatabaseEngine:
         tables = [stmt.from_table.name] + [join.table.name for join in stmt.joins]
         for table in tables:
             self._catalog.table(table)  # existencia; error tipado si falta
-        translated = select_to_optimizer(stmt)
+        translated = select_to_optimizer(stmt, self._star_columns(tables))
         batch = self._run_select_plan(txn_id, translated.statement, tables, include_rowid=False)
         hidden = frozenset(translated.hidden_columns)
         rows = _batch_to_rows(batch, exclude=hidden)
@@ -630,11 +687,14 @@ class DatabaseEngine:
         types = tuple(batch.schema.type_of(name).name for name in visible)
         return StatementResult(
             kind="select",
-            columns=tuple(visible),
+            columns=tuple(translated.output_names.get(name, name) for name in visible),
             column_types=types,
             rows=rows,
             rowcount=len(rows),
         )
+
+    def _star_columns(self, tables: list[str]) -> dict[str, tuple[str, ...]]:
+        return {name: self._catalog.table(name).column_names() for name in tables}
 
     def _optimize_select(
         self, opt_select: om.SelectStatement, tables: list[str], *, include_rowid: bool
@@ -643,11 +703,13 @@ class DatabaseEngine:
         try:
             return optimize(opt_select, stats_catalog)
         except opt_errors.UnresolvedColumnError as exc:
-            raise ProgrammingError(f"columna no resuelta: {exc}") from exc
+            raise ProgrammingError(f"columna no resuelta: {exc}", sqlstate="42703") from exc
         except opt_errors.UnsupportedQueryError as exc:
             raise NotSupportedError(f"consulta no soportada por el optimizador: {exc}") from exc
         except opt_errors.MissingStatisticsError as exc:
-            raise ProgrammingError(f"tabla desconocida para el optimizador: {exc}") from exc
+            raise ProgrammingError(
+                f"tabla desconocida para el optimizador: {exc}", sqlstate="42P01"
+            ) from exc
         except opt_errors.OptimizerError as exc:
             raise InternalError(f"el optimizador falló: {exc}") from exc
 
@@ -667,7 +729,7 @@ class DatabaseEngine:
             tables = [stmt.from_table.name] + [join.table.name for join in stmt.joins]
             for table in tables:
                 self._catalog.table(table)
-            translated = select_to_optimizer(stmt)
+            translated = select_to_optimizer(stmt, self._star_columns(tables))
             result = self._optimize_select(translated.statement, tables, include_rowid=False)
         text = optimizer_explain(result.physical_plan)
         rows: list[tuple[ColumnValue, ...]] = [(line,) for line in text.splitlines()]
@@ -693,9 +755,11 @@ class DatabaseEngine:
         try:
             return collect(plan, source)
         except vec_errors.DivisionByZeroError as exc:
-            raise DataError(str(exc)) from exc
+            raise DataError(str(exc), sqlstate="22012") from exc
         except vec_errors.UnresolvedColumnError as exc:
-            raise ProgrammingError(f"columna no resuelta en ejecución: {exc}") from exc
+            raise ProgrammingError(
+                f"columna no resuelta en ejecución: {exc}", sqlstate="42703"
+            ) from exc
         except (
             vec_errors.UnsupportedExpressionError,
             vec_errors.UnsupportedOperatorError,
@@ -712,16 +776,8 @@ class DatabaseEngine:
     def _optimizer_catalog(self, tables: list[str], *, include_rowid: bool) -> om.Catalog:
         stats: dict[str, om.TableStatistics] = {}
         for table_name in set(tables):
-            table = self._catalog.table(table_name)
             row_count = self._live_count(table_name)
-            # Sin recolector de estadísticas por columna en v1: se asume
-            # distinct_count = filas (columna casi única). Es la suposición
-            # documentada más conservadora para joins; los histogramas del
-            # optimizador quedan disponibles para cuando exista un ANALYZE.
-            columns = {
-                column.name: om.ColumnStatistics(distinct_count=max(1, row_count))
-                for column in table.columns
-            }
+            columns = self._column_statistics(table_name).for_optimizer(row_count)
             if include_rowid:
                 columns[ROWID_COLUMN] = om.ColumnStatistics(distinct_count=max(1, row_count))
             indexes = tuple(
@@ -732,6 +788,40 @@ class DatabaseEngine:
                 row_count=row_count, columns=columns, indexes=indexes
             )
         return om.Catalog(tables=stats)
+
+    def analyze(self, table: str | None = None) -> StatementResult:
+        """`ANALYZE [tabla]`: recalcula ya las estadísticas por columna de
+        una tabla o de todas, sin esperar al umbral de auto-ANALYZE."""
+        with self._lock:
+            self._ensure_open()
+            if table is not None and table not in self._catalog.tables:
+                raise ProgrammingError(f"la tabla '{table}' no existe", sqlstate="42P01")
+            for name in [table] if table is not None else sorted(self._catalog.tables):
+                self._analyze_table(name)
+        return StatementResult(kind="analyze", rowcount=0)
+
+    def table_statistics(self, table: str) -> TableStatistics:
+        """Estadísticas actuales de `table` (analizándola si hace falta);
+        para inspección y tests."""
+        with self._lock:
+            self._ensure_open()
+            return self._column_statistics(table)
+
+    def _column_statistics(self, table: str) -> TableStatistics:
+        """Estadísticas por columna de `table`, analizándola si nunca se
+        analizó o si cambió más del umbral de auto-ANALYZE desde entonces."""
+        cached = self._table_stats.get(table)
+        if cached is None or cached.needs_refresh(self._live_count(table)):
+            cached = self._analyze_table(table)
+        return cached
+
+    def _analyze_table(self, table: str) -> TableStatistics:
+        columns = self._catalog.table(table).column_names()
+        rows = (decode_row_payload(p) for _, p in self._row_store.latest_live_rows(table))
+        stats = analyze(columns, rows)
+        self._table_stats[table] = stats
+        self._live_counts[table] = stats.row_count
+        return stats
 
     def _live_count(self, table: str) -> int:
         cached = self._live_counts.get(table)
@@ -753,17 +843,34 @@ class DatabaseEngine:
         else:
             target_columns = table.column_names()
 
-        new_rows: list[dict[str, ColumnValue]] = []
+        provided_rows: list[dict[str, ColumnValue]] = []
+        if stmt.source is not None:
+            # INSERT ... SELECT: la consulta origen corre por el pipeline
+            # completo bajo la MISMA transacción (mismo snapshot MVCC); sus
+            # filas se insertan con las mismas reglas que un VALUES.
+            selected = self._execute_select(txn_id, stmt.source)
+            if len(selected.columns) != len(target_columns):
+                raise ProgrammingError(
+                    f"INSERT espera {len(target_columns)} columnas y el SELECT devuelve "
+                    f"{len(selected.columns)}",
+                    sqlstate="42601",
+                )
+            provided_rows = [dict(zip(target_columns, row, strict=True)) for row in selected.rows]
         for row_exprs in stmt.rows:
             if len(row_exprs) != len(target_columns):
                 raise ProgrammingError(
                     f"INSERT espera {len(target_columns)} valores por fila, "
                     f"recibidos {len(row_exprs)}"
                 )
-            provided = {
-                name: evaluate_constant(expr)
-                for name, expr in zip(target_columns, row_exprs, strict=True)
-            }
+            provided_rows.append(
+                {
+                    name: evaluate_constant(expr)
+                    for name, expr in zip(target_columns, row_exprs, strict=True)
+                }
+            )
+
+        new_rows: list[dict[str, ColumnValue]] = []
+        for provided in provided_rows:
             row: dict[str, ColumnValue] = {}
             for column in table.columns:
                 if column.name in provided:
@@ -799,6 +906,16 @@ class DatabaseEngine:
             self._mvcc.put(txn_id, make_row_id(table, rowid), encode_row_payload(row))
         except TransactionNotActiveError as exc:
             raise ProgrammingError(str(exc)) from exc
+        self._note_unique_write(txn_id, table, rowid, row)
+
+    def _note_unique_write(
+        self, txn_id: TransactionId, table: str, rowid: int, row: dict[str, ColumnValue] | None
+    ) -> None:
+        """Mantiene el índice de claves únicas de la transacción (si ya lo
+        construyó) al día con su propia escritura; `row=None` es un borrado."""
+        entry = self._txn_unique.get(txn_id, {}).get(table)
+        if entry is not None:
+            entry[1].replace(rowid, row)
 
     def _coerce_value(
         self, table_name: str, column: ColumnSchema, value: ColumnValue
@@ -807,7 +924,10 @@ class DatabaseEngine:
 
         if value is None:
             if column.not_null or column.primary_key:
-                raise IntegrityError(f"la columna '{column.name}' de '{table_name}' no admite NULL")
+                raise IntegrityError(
+                    f"la columna '{column.name}' de '{table_name}' no admite NULL",
+                    sqlstate="23502",
+                )
             return None
         # bool antes que int: en Python bool es subclase de int y colaría
         # como entero en una columna INTEGER.
@@ -815,7 +935,8 @@ class DatabaseEngine:
             if column.column_type is not ColumnType.BOOLEAN:
                 raise DataError(
                     f"valor booleano para la columna {column.column_type.name} "
-                    f"'{column.name}' de '{table_name}'"
+                    f"'{column.name}' de '{table_name}'",
+                    sqlstate="42804",
                 )
             return value
         if isinstance(value, int):
@@ -825,23 +946,26 @@ class DatabaseEngine:
                 return float(value)
             raise DataError(
                 f"valor entero para la columna {column.column_type.name} "
-                f"'{column.name}' de '{table_name}'"
+                f"'{column.name}' de '{table_name}'",
+                sqlstate="42804",
             )
         if isinstance(value, float):
             if column.column_type is ColumnType.FLOAT:
                 return value
             raise DataError(
                 f"valor de coma flotante para la columna {column.column_type.name} "
-                f"'{column.name}' de '{table_name}' (no hay truncado implícito)"
+                f"'{column.name}' de '{table_name}' (no hay truncado implícito)",
+                sqlstate="42804",
             )
         if isinstance(value, str):
             if column.column_type is ColumnType.STRING:
                 return value
             raise DataError(
                 f"valor de texto para la columna {column.column_type.name} "
-                f"'{column.name}' de '{table_name}'"
+                f"'{column.name}' de '{table_name}'",
+                sqlstate="42804",
             )
-        raise DataError(f"tipo de valor no soportado: {type(value).__name__}")
+        raise DataError(f"tipo de valor no soportado: {type(value).__name__}", sqlstate="42804")
 
     # -- restricciones de unicidad ---------------------------------------
 
@@ -866,15 +990,13 @@ class DatabaseEngine:
     def _visible_table_rows(
         self, txn_id: TransactionId, table: str
     ) -> list[tuple[int, dict[str, ColumnValue]]]:
-        prefix = f"{table}{ROW_ID_SEPARATOR}"
+        start, end = RowId(table_row_prefix(table)), RowId(table_row_prefix_end(table))
         try:
-            visible = self._mvcc.scan(txn_id)
+            visible = self._mvcc.scan_range(txn_id, start, end)
         except TransactionNotActiveError as exc:
             raise ProgrammingError(str(exc)) from exc
         return [
-            (split_row_id(row_id)[1], decode_row_payload(payload))
-            for row_id, payload in visible
-            if str(row_id).startswith(prefix)
+            (split_row_id(row_id)[1], decode_row_payload(payload)) for row_id, payload in visible
         ]
 
     def _check_unique_constraints(
@@ -885,36 +1007,44 @@ class DatabaseEngine:
         *,
         exclude_rowids: set[int],
     ) -> None:
-        """Unicidad evaluada contra el snapshot de la propia transacción.
-
-        Limitación honesta (documentada en el README): dos transacciones
-        concurrentes pueden insertar el mismo valor "único" sin verse — el
-        first-committer-wins de MVCC protege filas, no valores de columna.
-        Cerrar ese hueco requiere validación de unicidad en el commit del
-        gestor MVCC (mejora propuesta al subproyecto, no parcheada aquí).
-        """
+        """Unicidad evaluada contra el snapshot de la propia transacción
+        (más sus escrituras), vía su `UniqueKeyIndex`: coste proporcional a
+        las filas candidatas, no a la tabla. Lo que confirmen otras
+        transacciones después del snapshot lo atrapa la revalidación del
+        commit (`_validate_unique_at_commit`)."""
         constraints = self._unique_constraints(table)
         if not constraints:
             return
-        existing = self._visible_table_rows(txn_id, table.name)
+        index = self._txn_unique_index(txn_id, table.name, constraints)
         for constraint in constraints:
             seen: set[tuple[ColumnValue, ...]] = set()
-            for rowid, row in existing:
-                if rowid in exclude_rowids:
-                    continue
-                key = tuple(row.get(col) for col in constraint)
-                if None not in key:
-                    seen.add(key)
             for row in candidate_rows:
-                key = tuple(row.get(col) for col in constraint)
-                if None in key:
+                key = key_of(row, constraint)
+                if key is None:
                     continue  # los NULL nunca chocan entre sí, como en SQL
-                if key in seen:
+                owner = index.owner(constraint, key)
+                if (owner is not None and owner not in exclude_rowids) or key in seen:
                     raise IntegrityError(
                         f"valor duplicado {key!r} para la restricción única "
-                        f"({', '.join(constraint)}) de '{table.name}'"
+                        f"({', '.join(constraint)}) de '{table.name}'",
+                        sqlstate="23505",
                     )
                 seen.add(key)
+
+    def _txn_unique_index(
+        self, txn_id: TransactionId, table: str, constraints: list[tuple[str, ...]]
+    ) -> UniqueKeyIndex:
+        per_txn = self._txn_unique.setdefault(txn_id, {})
+        entry = per_txn.get(table)
+        if (
+            entry is None
+            or entry[0] != self._commit_generation
+            or entry[1].constraints != tuple(constraints)
+        ):
+            index = UniqueKeyIndex.build(constraints, self._visible_table_rows(txn_id, table))
+            per_txn[table] = (self._commit_generation, index)
+            return index
+        return entry[1]
 
     # -- UPDATE / DELETE --------------------------------------------------
 
@@ -950,7 +1080,8 @@ class DatabaseEngine:
             table.column(assignment.column)
             if assignment.column in assigned_names:
                 raise ProgrammingError(
-                    f"la columna '{assignment.column}' aparece dos veces en el SET"
+                    f"la columna '{assignment.column}' aparece dos veces en el SET",
+                    sqlstate="42601",
                 )
             if _contains_aggregate(assignment.value):
                 raise ProgrammingError("las funciones agregadas no están permitidas en SET")
@@ -1011,6 +1142,7 @@ class DatabaseEngine:
                 self._mvcc.delete(txn_id, make_row_id(stmt.table, rowid))
             except TransactionNotActiveError as exc:
                 raise ProgrammingError(str(exc)) from exc
+            self._note_unique_write(txn_id, stmt.table, rowid, None)
             self._record_write(txn_id, stmt.table, rowid)
         return StatementResult(kind="delete", rowcount=len(matched))
 
@@ -1021,7 +1153,7 @@ class DatabaseEngine:
         if stmt.table in self._catalog.tables:
             if stmt.if_not_exists:
                 return StatementResult(kind="create_table", rowcount=0)
-            raise ProgrammingError(f"la tabla '{stmt.table}' ya existe")
+            raise ProgrammingError(f"la tabla '{stmt.table}' ya existe", sqlstate="42P07")
 
         columns: list[ColumnSchema] = []
         seen_names: set[str] = set()
@@ -1071,11 +1203,78 @@ class DatabaseEngine:
                 )
             columns.append(column)
 
+        implicit_indexes = self._apply_table_constraints(stmt, columns, primary_keys)
         self._catalog.add_table(TableSchema(name=stmt.table, columns=tuple(columns)))
+        for index in implicit_indexes:
+            self._catalog.add_index(index)
         self._next_rowid.setdefault(stmt.table, 1)
         self._live_counts[stmt.table] = 0
+        self._table_stats.pop(stmt.table, None)
+        self._committed_unique.pop(stmt.table, None)
         self._persist_catalog()
         return StatementResult(kind="create_table", rowcount=0)
+
+    def _apply_table_constraints(
+        self,
+        stmt: pm.CreateTableStatement,
+        columns: list[ColumnSchema],
+        column_level_pks: int,
+    ) -> list[IndexSchema]:
+        """Restricciones de tabla (`PRIMARY KEY (..)`, `UNIQUE (..)`), la forma
+        que emiten los ORMs. Una PK de una sola columna equivale exactamente
+        a la PK de columna. Una PK compuesta se materializa como columnas NOT
+        NULL más un índice único implícito — en nanosql la PK no tiene
+        significado físico (las filas se ordenan por rowid), así que ambas
+        formas imponen la misma restricción. Los nombres implícitos siguen la
+        convención de PostgreSQL (`<tabla>_pkey`, `<tabla>_<cols>_key`).
+        Modifica `columns` in situ y devuelve los índices a registrar."""
+        by_name = {column.name: i for i, column in enumerate(columns)}
+        indexes: list[IndexSchema] = []
+        index_names: set[str] = set()
+        primary_seen = column_level_pks > 0
+        for constraint in stmt.constraints:
+            for name in constraint.columns:
+                if name not in by_name:
+                    raise ProgrammingError(
+                        f"la restricción de '{stmt.table}' referencia la columna "
+                        f"inexistente '{name}'",
+                        sqlstate="42703",
+                    )
+            if len(set(constraint.columns)) != len(constraint.columns):
+                raise ProgrammingError("columna repetida en una restricción de tabla")
+            if constraint.kind is pm.TableConstraintKind.PRIMARY_KEY:
+                if primary_seen:
+                    raise ProgrammingError(
+                        f"la tabla '{stmt.table}' declara más de una clave primaria",
+                        sqlstate="42P16",
+                    )
+                primary_seen = True
+                for name in constraint.columns:
+                    position = by_name[name]
+                    columns[position] = replace(
+                        columns[position],
+                        not_null=True,
+                        primary_key=len(constraint.columns) == 1,
+                    )
+                if len(constraint.columns) == 1:
+                    continue
+                index_name = constraint.name or f"{stmt.table}_pkey"
+            else:
+                if len(constraint.columns) == 1 and constraint.name is None:
+                    position = by_name[constraint.columns[0]]
+                    columns[position] = replace(columns[position], unique=True)
+                    continue
+                index_name = constraint.name or (f"{stmt.table}_{'_'.join(constraint.columns)}_key")
+            _validate_identifier(index_name, "índice")
+            if index_name in self._catalog.indexes or index_name in index_names:
+                raise ProgrammingError(f"el índice '{index_name}' ya existe", sqlstate="42P07")
+            index_names.add(index_name)
+            indexes.append(
+                IndexSchema(
+                    name=index_name, table=stmt.table, columns=constraint.columns, unique=True
+                )
+            )
+        return indexes
 
     def _execute_create_index(
         self, ddl_txn: TransactionId, stmt: pm.CreateIndexStatement
@@ -1084,7 +1283,7 @@ class DatabaseEngine:
         if stmt.index_name in self._catalog.indexes:
             if stmt.if_not_exists:
                 return StatementResult(kind="create_index", rowcount=0)
-            raise ProgrammingError(f"el índice '{stmt.index_name}' ya existe")
+            raise ProgrammingError(f"el índice '{stmt.index_name}' ya existe", sqlstate="42P07")
         table = self._catalog.table(stmt.table)
         if stmt.unique:
             # Un índice UNIQUE sobre datos existentes sólo es válido si esos
@@ -1099,7 +1298,8 @@ class DatabaseEngine:
                 if key in seen:
                     raise IntegrityError(
                         f"no se puede crear el índice único '{stmt.index_name}': "
-                        f"valor duplicado {key!r} en los datos existentes"
+                        f"valor duplicado {key!r} en los datos existentes",
+                        sqlstate="23505",
                     )
                 seen.add(key)
         self._catalog.add_index(
@@ -1112,6 +1312,39 @@ class DatabaseEngine:
         )
         self._persist_catalog()
         return StatementResult(kind="create_index", rowcount=0)
+
+    def _execute_drop_table(self, stmt: pm.DropTableStatement) -> StatementResult:
+        """`DROP TABLE` bajo el lock EXCLUSIVE de la tabla (ninguna
+        transacción en vuelo la está usando).
+
+        Orden deliberado para la recuperación ante fallos: primero se borran
+        todas las filas en una transacción normal (WAL + commit: duradero),
+        y sólo después se retira el esquema del catálogo. Un crash entre
+        ambos pasos deja la tabla vacía pero existente (basta repetir el
+        DROP); el orden inverso podría dejar filas huérfanas que una futura
+        `CREATE TABLE` con el mismo nombre "resucitaría". Los rowids no se
+        reutilizan (el contador de la tabla no se reinicia) y el GC de MVCC
+        poda las versiones borradas más tarde, como con cualquier DELETE."""
+        if stmt.table not in self._catalog.tables:
+            if stmt.if_exists:
+                return StatementResult(kind="drop_table", rowcount=0)
+            raise ProgrammingError(f"la tabla '{stmt.table}' no existe", sqlstate="42P01")
+        txn = self.begin_transaction(IsolationLevel.READ_COMMITTED)
+        try:
+            for rowid, _ in self._visible_table_rows(txn, stmt.table):
+                self._mvcc.delete(txn, make_row_id(stmt.table, rowid))
+                self._note_unique_write(txn, stmt.table, rowid, None)
+                self._record_write(txn, stmt.table, rowid)
+        except BaseException:
+            self.rollback(txn)
+            raise
+        self.commit(txn)
+        self._catalog.drop_table(stmt.table)
+        self._live_counts.pop(stmt.table, None)
+        self._table_stats.pop(stmt.table, None)
+        self._committed_unique.pop(stmt.table, None)
+        self._persist_catalog()
+        return StatementResult(kind="drop_table", rowcount=0)
 
     def _persist_catalog(self) -> None:
         if self._path is not None:

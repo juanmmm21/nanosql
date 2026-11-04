@@ -122,9 +122,16 @@ def _expression_children(expr: pm.Expression) -> Iterator[pm.Expression]:
         yield expr.operand
 
 
+# Nodos sin hijos: ni contienen subconsultas ni hay que recorrerlos. Un
+# INSERT de 500 filas son miles de ellos, y se recorría dos veces.
+_LEAF_TYPES = frozenset({pm.Literal, pm.Placeholder, pm.ColumnRef, pm.Star})
+
+
 def _iter_subqueries(expr: pm.Expression) -> Iterator[pm.Subquery]:
     """Subconsultas inmediatas de `expr` (las anidadas más profundo se
     alcanzan recursivamente al procesar cada nivel)."""
+    if expr.__class__ in _LEAF_TYPES:
+        return
     if isinstance(expr, pm.Subquery):
         yield expr
         return
@@ -330,6 +337,8 @@ def _statement_expressions(stmt: pm.Statement) -> Iterator[pm.Expression]:
     elif isinstance(stmt, pm.InsertStatement):
         for row in stmt.rows:
             yield from row
+        if stmt.source is not None:
+            yield from _select_expressions(stmt.source)
     elif isinstance(stmt, pm.UpdateStatement):
         for assignment in stmt.assignments:
             yield assignment.value
@@ -341,7 +350,12 @@ def _statement_expressions(stmt: pm.Statement) -> Iterator[pm.Expression]:
 
 
 def contains_subquery(stmt: pm.Statement) -> bool:
-    return any(True for expr in _statement_expressions(stmt) for _ in _iter_subqueries(expr))
+    return any(
+        True
+        for expr in _statement_expressions(stmt)
+        if expr.__class__ not in _LEAF_TYPES
+        for _ in _iter_subqueries(expr)
+    )
 
 
 def _subquery_tables(select: pm.SelectStatement) -> Iterator[str]:
@@ -364,7 +378,11 @@ def statement_tables(stmt: pm.Statement) -> list[str]:
         return tables
     if isinstance(stmt, pm.InsertStatement | pm.UpdateStatement | pm.DeleteStatement):
         tables.append(stmt.table)
+    if isinstance(stmt, pm.InsertStatement) and stmt.source is not None:
+        tables.extend(statement_tables(stmt.source))
     for expr in _statement_expressions(stmt):
+        if expr.__class__ in _LEAF_TYPES:
+            continue
         for subquery in _iter_subqueries(expr):
             tables.extend(_subquery_tables(subquery.statement))
     return tables
@@ -379,9 +397,13 @@ def _outer_scope(stmt: pm.Statement, catalog: Catalog) -> tuple[_Scope, ...]:
         schema = catalog.tables.get(stmt.table)
         columns = frozenset(schema.column_names()) if schema is not None else frozenset()
         return (_Scope(qualifiers=frozenset({stmt.table}), columns=columns),)
-    # INSERT: sus VALUES no ven ninguna tabla externa — una referencia de
-    # columna dentro de una subconsulta de INSERT solo puede ser de la
-    # propia subconsulta.
+    if isinstance(stmt, pm.InsertStatement) and stmt.source is not None:
+        # INSERT ... SELECT: las subconsultas viven dentro del SELECT origen
+        # y su ámbito externo es el de ese SELECT.
+        return (_scope_of(stmt.source, catalog),)
+    # INSERT ... VALUES: sus VALUES no ven ninguna tabla externa — una
+    # referencia de columna dentro de una subconsulta de INSERT solo puede
+    # ser de la propia subconsulta.
     return ()
 
 
@@ -412,6 +434,11 @@ def expand_statement(
             columns=stmt.columns,
             rows=tuple(
                 tuple(_expand_expression(e, catalog, run_select) for e in row) for row in stmt.rows
+            ),
+            source=(
+                _expand_select(stmt.source, catalog, run_select)
+                if stmt.source is not None
+                else None
             ),
         )
     if isinstance(stmt, pm.UpdateStatement):

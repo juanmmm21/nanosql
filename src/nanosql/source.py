@@ -19,7 +19,7 @@ import json
 from collections.abc import Iterator
 
 import numpy as np
-from mvcc_transaction_manager import MVCCTransactionManager, TransactionId
+from mvcc_transaction_manager import MVCCTransactionManager, RowId, TransactionId
 from vectorized_execution_engine.batch import (
     DEFAULT_BATCH_SIZE,
     RowBatch,
@@ -29,7 +29,7 @@ from vectorized_execution_engine.models import ColumnType, Schema
 
 from .catalog import Catalog, ColumnValue, TableSchema
 from .errors import InternalError
-from .rowstore import split_row_id, table_row_prefix
+from .rowstore import split_row_id, table_row_prefix, table_row_prefix_end
 
 # Columna sintética con el rowid interno de cada fila, expuesta SOLO cuando
 # el engine planifica un UPDATE/DELETE (nunca en un SELECT de usuario): es
@@ -100,11 +100,9 @@ class MvccTableSource:
         schema = self.schema(table_name)
         prefix = table_row_prefix(table_name)
 
-        visible = [
-            (row_id, payload)
-            for row_id, payload in self._manager.scan(self._txn_id)
-            if str(row_id).startswith(prefix)
-        ]
+        visible = self._manager.scan_range(
+            self._txn_id, RowId(prefix), RowId(table_row_prefix_end(table_name))
+        )
 
         for start in range(0, len(visible), self._batch_size):
             chunk = visible[start : start + self._batch_size]

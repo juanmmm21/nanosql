@@ -1,0 +1,8 @@
+{
+  "backend": "lsm",
+  "kills": 300,
+  "acknowledged_batches": 997,
+  "recovered_batches": 997,
+  "violations": [],
+  "seconds": 151.2
+}
