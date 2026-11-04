@@ -507,6 +507,10 @@ class Connection:
         return StatementResult(kind="rollback", rowcount=0)
 
     def _execute_parsed(self, engine: DatabaseEngine, statement: pm.Statement) -> StatementResult:
+        if isinstance(statement, pm.AnalyzeStatement):
+            # Lee sólo versiones confirmadas: no necesita transacción ni toca
+            # la del usuario (como en PostgreSQL, vale dentro de un BEGIN).
+            return engine.analyze(statement.table)
         if isinstance(
             statement,
             pm.CreateTableStatement | pm.CreateIndexStatement | pm.DropTableStatement,

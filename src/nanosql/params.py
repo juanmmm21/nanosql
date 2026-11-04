@@ -183,7 +183,11 @@ def bind_statement(stmt: pm.Statement, params: Sequence[ColumnValue] | None) -> 
     elif isinstance(stmt, pm.DeleteStatement):
         bound = pm.DeleteStatement(table=stmt.table, where=_optional(stmt.where, binder))
     elif isinstance(
-        stmt, pm.CreateTableStatement | pm.CreateIndexStatement | pm.DropTableStatement
+        stmt,
+        pm.CreateTableStatement
+        | pm.CreateIndexStatement
+        | pm.DropTableStatement
+        | pm.AnalyzeStatement,
     ):
         if params:
             raise ProgrammingError("el DDL no admite parámetros '?'")

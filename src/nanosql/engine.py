@@ -88,6 +88,7 @@ from .rowstore import (
     table_row_prefix_end,
 )
 from .source import ROWID_COLUMN, MvccTableSource, decode_row_payload, encode_row_payload
+from .statistics import TableStatistics, analyze
 from .storage import BPlusTreeBackend, KeyValueBackend, LsmTreeBackend
 from .subqueries import contains_subquery, expand_statement, statement_tables
 from .translate import (
@@ -298,6 +299,7 @@ class DatabaseEngine:
         self._commits_since_checkpoint = 0
         self._next_rowid: dict[str, int] = {}
         self._live_counts: dict[str, int] = {}
+        self._table_stats: dict[str, TableStatistics] = {}
         self._txn_written_rows: dict[TransactionId, dict[str, set[int]]] = {}
         self._closed = False
 
@@ -754,16 +756,8 @@ class DatabaseEngine:
     def _optimizer_catalog(self, tables: list[str], *, include_rowid: bool) -> om.Catalog:
         stats: dict[str, om.TableStatistics] = {}
         for table_name in set(tables):
-            table = self._catalog.table(table_name)
             row_count = self._live_count(table_name)
-            # Sin recolector de estadísticas por columna en v1: se asume
-            # distinct_count = filas (columna casi única). Es la suposición
-            # documentada más conservadora para joins; los histogramas del
-            # optimizador quedan disponibles para cuando exista un ANALYZE.
-            columns = {
-                column.name: om.ColumnStatistics(distinct_count=max(1, row_count))
-                for column in table.columns
-            }
+            columns = self._column_statistics(table_name).for_optimizer(row_count)
             if include_rowid:
                 columns[ROWID_COLUMN] = om.ColumnStatistics(distinct_count=max(1, row_count))
             indexes = tuple(
@@ -774,6 +768,40 @@ class DatabaseEngine:
                 row_count=row_count, columns=columns, indexes=indexes
             )
         return om.Catalog(tables=stats)
+
+    def analyze(self, table: str | None = None) -> StatementResult:
+        """`ANALYZE [tabla]`: recalcula ya las estadísticas por columna de
+        una tabla o de todas, sin esperar al umbral de auto-ANALYZE."""
+        with self._lock:
+            self._ensure_open()
+            if table is not None and table not in self._catalog.tables:
+                raise ProgrammingError(f"la tabla '{table}' no existe", sqlstate="42P01")
+            for name in [table] if table is not None else sorted(self._catalog.tables):
+                self._analyze_table(name)
+        return StatementResult(kind="analyze", rowcount=0)
+
+    def table_statistics(self, table: str) -> TableStatistics:
+        """Estadísticas actuales de `table` (analizándola si hace falta);
+        para inspección y tests."""
+        with self._lock:
+            self._ensure_open()
+            return self._column_statistics(table)
+
+    def _column_statistics(self, table: str) -> TableStatistics:
+        """Estadísticas por columna de `table`, analizándola si nunca se
+        analizó o si cambió más del umbral de auto-ANALYZE desde entonces."""
+        cached = self._table_stats.get(table)
+        if cached is None or cached.needs_refresh(self._live_count(table)):
+            cached = self._analyze_table(table)
+        return cached
+
+    def _analyze_table(self, table: str) -> TableStatistics:
+        columns = self._catalog.table(table).column_names()
+        rows = (decode_row_payload(p) for p in self._row_store.latest_live_payloads(table))
+        stats = analyze(columns, rows)
+        self._table_stats[table] = stats
+        self._live_counts[table] = stats.row_count
+        return stats
 
     def _live_count(self, table: str) -> int:
         cached = self._live_counts.get(table)
@@ -1143,6 +1171,7 @@ class DatabaseEngine:
             self._catalog.add_index(index)
         self._next_rowid.setdefault(stmt.table, 1)
         self._live_counts[stmt.table] = 0
+        self._table_stats.pop(stmt.table, None)
         self._persist_catalog()
         return StatementResult(kind="create_table", rowcount=0)
 
@@ -1272,6 +1301,7 @@ class DatabaseEngine:
         self.commit(txn)
         self._catalog.drop_table(stmt.table)
         self._live_counts.pop(stmt.table, None)
+        self._table_stats.pop(stmt.table, None)
         self._persist_catalog()
         return StatementResult(kind="drop_table", rowcount=0)
 
