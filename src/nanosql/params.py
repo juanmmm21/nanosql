@@ -18,11 +18,24 @@ import sql_query_parser.models as pm
 from .catalog import ColumnValue
 from .errors import DataError, ProgrammingError
 
+_LITERAL_TYPES: dict[type, pm.LiteralType] = {
+    type(None): pm.LiteralType.NULL,
+    bool: pm.LiteralType.BOOLEAN,
+    int: pm.LiteralType.INTEGER,
+    float: pm.LiteralType.FLOAT,
+    str: pm.LiteralType.STRING,
+}
+
 
 def literal_for_value(value: ColumnValue) -> pm.Literal:
     """Literal tipado del AST del parser para un valor Python plano. Público
     dentro del paquete: lo comparte `subqueries.py` para materializar los
     resultados de una subconsulta como literales."""
+    # Tipo exacto primero (lo habitual: miles por INSERT masivo); las
+    # subclases siguen la cadena de abajo, con el mismo resultado.
+    literal_type = _LITERAL_TYPES.get(value.__class__)
+    if literal_type is not None:
+        return pm.Literal(value, literal_type)
     # bool antes que int: en Python bool es subclase de int.
     if value is None:
         return pm.Literal(None, pm.LiteralType.NULL)

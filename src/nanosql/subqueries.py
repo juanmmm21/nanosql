@@ -122,9 +122,16 @@ def _expression_children(expr: pm.Expression) -> Iterator[pm.Expression]:
         yield expr.operand
 
 
+# Nodos sin hijos: ni contienen subconsultas ni hay que recorrerlos. Un
+# INSERT de 500 filas son miles de ellos, y se recorría dos veces.
+_LEAF_TYPES = frozenset({pm.Literal, pm.Placeholder, pm.ColumnRef, pm.Star})
+
+
 def _iter_subqueries(expr: pm.Expression) -> Iterator[pm.Subquery]:
     """Subconsultas inmediatas de `expr` (las anidadas más profundo se
     alcanzan recursivamente al procesar cada nivel)."""
+    if expr.__class__ in _LEAF_TYPES:
+        return
     if isinstance(expr, pm.Subquery):
         yield expr
         return
@@ -343,7 +350,12 @@ def _statement_expressions(stmt: pm.Statement) -> Iterator[pm.Expression]:
 
 
 def contains_subquery(stmt: pm.Statement) -> bool:
-    return any(True for expr in _statement_expressions(stmt) for _ in _iter_subqueries(expr))
+    return any(
+        True
+        for expr in _statement_expressions(stmt)
+        if expr.__class__ not in _LEAF_TYPES
+        for _ in _iter_subqueries(expr)
+    )
 
 
 def _subquery_tables(select: pm.SelectStatement) -> Iterator[str]:
@@ -369,6 +381,8 @@ def statement_tables(stmt: pm.Statement) -> list[str]:
     if isinstance(stmt, pm.InsertStatement) and stmt.source is not None:
         tables.extend(statement_tables(stmt.source))
     for expr in _statement_expressions(stmt):
+        if expr.__class__ in _LEAF_TYPES:
+            continue
         for subquery in _iter_subqueries(expr):
             tables.extend(_subquery_tables(subquery.statement))
     return tables
