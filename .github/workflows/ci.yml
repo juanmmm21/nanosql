@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install psql (client for the wire-protocol tests)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
+      - name: Install nanosql with every component and the dev extras
+        run: pip install -e ".[distributed,dev]"
+      - name: Tests
+        run: pytest -q
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -e ".[distributed,dev]"
+      - run: ruff check .
+      - run: ruff format --check src tests
+      - run: mypy --strict src/
