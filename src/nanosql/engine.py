@@ -26,7 +26,7 @@ tabla con el `RLock` en mano bloquearía el commit que debe liberarlo.
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import cost_based_query_optimizer.errors as opt_errors
@@ -1086,11 +1086,76 @@ class DatabaseEngine:
                 )
             columns.append(column)
 
+        implicit_indexes = self._apply_table_constraints(stmt, columns, primary_keys)
         self._catalog.add_table(TableSchema(name=stmt.table, columns=tuple(columns)))
+        for index in implicit_indexes:
+            self._catalog.add_index(index)
         self._next_rowid.setdefault(stmt.table, 1)
         self._live_counts[stmt.table] = 0
         self._persist_catalog()
         return StatementResult(kind="create_table", rowcount=0)
+
+    def _apply_table_constraints(
+        self,
+        stmt: pm.CreateTableStatement,
+        columns: list[ColumnSchema],
+        column_level_pks: int,
+    ) -> list[IndexSchema]:
+        """Restricciones de tabla (`PRIMARY KEY (..)`, `UNIQUE (..)`), la forma
+        que emiten los ORMs. Una PK de una sola columna equivale exactamente
+        a la PK de columna. Una PK compuesta se materializa como columnas NOT
+        NULL más un índice único implícito — en nanosql la PK no tiene
+        significado físico (las filas se ordenan por rowid), así que ambas
+        formas imponen la misma restricción. Los nombres implícitos siguen la
+        convención de PostgreSQL (`<tabla>_pkey`, `<tabla>_<cols>_key`).
+        Modifica `columns` in situ y devuelve los índices a registrar."""
+        by_name = {column.name: i for i, column in enumerate(columns)}
+        indexes: list[IndexSchema] = []
+        index_names: set[str] = set()
+        primary_seen = column_level_pks > 0
+        for constraint in stmt.constraints:
+            for name in constraint.columns:
+                if name not in by_name:
+                    raise ProgrammingError(
+                        f"la restricción de '{stmt.table}' referencia la columna "
+                        f"inexistente '{name}'",
+                        sqlstate="42703",
+                    )
+            if len(set(constraint.columns)) != len(constraint.columns):
+                raise ProgrammingError("columna repetida en una restricción de tabla")
+            if constraint.kind is pm.TableConstraintKind.PRIMARY_KEY:
+                if primary_seen:
+                    raise ProgrammingError(
+                        f"la tabla '{stmt.table}' declara más de una clave primaria",
+                        sqlstate="42P16",
+                    )
+                primary_seen = True
+                for name in constraint.columns:
+                    position = by_name[name]
+                    columns[position] = replace(
+                        columns[position],
+                        not_null=True,
+                        primary_key=len(constraint.columns) == 1,
+                    )
+                if len(constraint.columns) == 1:
+                    continue
+                index_name = constraint.name or f"{stmt.table}_pkey"
+            else:
+                if len(constraint.columns) == 1 and constraint.name is None:
+                    position = by_name[constraint.columns[0]]
+                    columns[position] = replace(columns[position], unique=True)
+                    continue
+                index_name = constraint.name or (f"{stmt.table}_{'_'.join(constraint.columns)}_key")
+            _validate_identifier(index_name, "índice")
+            if index_name in self._catalog.indexes or index_name in index_names:
+                raise ProgrammingError(f"el índice '{index_name}' ya existe", sqlstate="42P07")
+            index_names.add(index_name)
+            indexes.append(
+                IndexSchema(
+                    name=index_name, table=stmt.table, columns=constraint.columns, unique=True
+                )
+            )
+        return indexes
 
     def _execute_create_index(
         self, ddl_txn: TransactionId, stmt: pm.CreateIndexStatement
