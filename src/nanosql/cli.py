@@ -16,6 +16,7 @@ import argparse
 import sys
 import time
 from collections.abc import Callable, Sequence
+from pathlib import Path
 
 from sql_query_parser import SqlParserError, tokenize
 from sql_query_parser.models import TokenType
@@ -335,10 +336,96 @@ def serve_main(argv: Sequence[str]) -> int:
     return 0
 
 
+def _build_cluster_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="nanosql cluster",
+        description=(
+            "Clúster nanosql replicado por Raft real (TCP + log en disco), un proceso por nodo."
+        ),
+    )
+    sub = parser.add_subparsers(dest="action", required=True)
+    start = sub.add_parser("start", help="arranca N nodos y espera (Ctrl-C para parar)")
+    chaos = sub.add_parser("chaos", help="carga + fallos + verificación de linealizabilidad")
+    for p in (start, chaos):
+        p.add_argument("--nodes", type=int, default=3, choices=[3, 4, 5])
+        p.add_argument("--data-dir", type=Path, default=None)
+    chaos.add_argument("--duration", type=float, default=60.0, help="segundos de carga")
+    chaos.add_argument("--clients", type=int, default=6)
+    chaos.add_argument("--keys", type=int, default=4)
+    chaos.add_argument("--seed", type=int, default=1)
+    chaos.add_argument(
+        "--faults",
+        default="kill-leader,partition,partition-leader,pause",
+        help="tipos de fallo separados por comas ('' = ninguno)",
+    )
+    chaos.add_argument("--report", type=Path, default=None, help="escribe el informe JSON")
+    chaos.add_argument("--history", type=Path, default=None, help="vuelca la historia JSONL")
+    return parser
+
+
+def cluster_main(argv: Sequence[str]) -> int:
+    import json
+    import tempfile
+
+    from .cluster.chaos import LocalCluster, run_chaos
+
+    args = _build_cluster_parser().parse_args(argv)
+    root = args.data_dir or Path(tempfile.mkdtemp(prefix="nanosql-cluster-"))
+    if args.action == "start":
+        cluster = LocalCluster(args.nodes, root).start()
+        print(f"clúster de {args.nodes} nodos en {root}")
+        for node_id, (host, port) in cluster.client_addr.items():
+            print(f"  {node_id}: clientes en {host}:{port}")
+        print("ClusterClient([...]) encuentra al líder solo; Ctrl-C para parar.")
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            cluster.stop()
+        return 0
+    faults = tuple(f for f in args.faults.split(",") if f)
+    report, history = run_chaos(
+        nodes=args.nodes,
+        duration=args.duration,
+        clients=args.clients,
+        keys=args.keys,
+        seed=args.seed,
+        root=root,
+        fault_kinds=faults,
+        progress=True,
+    )
+    summary = report.to_json()
+    print(json.dumps(summary, indent=2))
+    if args.report is not None:
+        args.report.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    if args.history is not None:
+        with open(args.history, "w", encoding="utf-8") as handle:
+            for op in history:
+                handle.write(
+                    json.dumps(
+                        {
+                            "process": op.process,
+                            "key": op.key,
+                            "kind": op.kind,
+                            "value": op.value,
+                            "output": op.output,
+                            "call": op.call,
+                            "ret": None if op.pending else op.ret,
+                        }
+                    )
+                    + "\n"
+                )
+    return 0 if summary["linearizable"] else 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments[:1] == ["serve"]:
         return serve_main(arguments[1:])
+    if arguments[:1] == ["cluster"]:
+        return cluster_main(arguments[1:])
     args = _build_parser().parse_args(arguments)
     if args.benchmark:
         from .benchmark import run_benchmark

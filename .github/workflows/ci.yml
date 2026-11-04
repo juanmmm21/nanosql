@@ -57,3 +57,26 @@ jobs:
         with:
           name: sqllogictest-results
           path: sqllogictest-results.json
+
+  chaos:
+    # Corrida corta del arnés de caos: clúster real de 3 procesos, kill -9
+    # del líder, particiones por proxy y SIGSTOP; falla si la historia no
+    # es linealizable. Las corridas largas (10+ min) están en el README.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -e ".[distributed]"
+      - name: 90 s of faults against a 3-node cluster
+        run: >-
+          nanosql cluster chaos --nodes 3 --duration 90 --seed ${{ github.run_number }}
+          --report chaos-report.json --history chaos-history.jsonl
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chaos
+          path: |
+            chaos-report.json
+            chaos-history.jsonl

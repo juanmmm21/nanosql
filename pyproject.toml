@@ -29,7 +29,7 @@ dependencies = [
 [project.optional-dependencies]
 # Modo distribuido opcional (no requerido para el uso embebido de nodo único).
 distributed = [
-    "raft-replication-log @ git+https://github.com/juanmmm21/raft-replication-log.git",
+    "raft-replication-log @ git+https://github.com/juanmmm21/raft-replication-log.git@feat/strata-roadmap",
     "distributed-query-router @ git+https://github.com/juanmmm21/distributed-query-router.git",
 ]
 # Clientes reales de PostgreSQL para los tests del servidor de protocolo
