@@ -1,0 +1,193 @@
+{
+  "files": {
+    "evidence_in1": {
+      "bug": 0,
+      "passed": 20,
+      "percent": 15.15,
+      "run": 132,
+      "skipped": 84,
+      "timeout": 0,
+      "unsupported": 112
+    },
+    "evidence_in2": {
+      "bug": 0,
+      "passed": 44,
+      "percent": 83.02,
+      "run": 53,
+      "skipped": 1,
+      "timeout": 0,
+      "unsupported": 9
+    },
+    "evidence_slt_lang_aggfunc": {
+      "bug": 0,
+      "passed": 5,
+      "percent": 100.0,
+      "run": 5,
+      "skipped": 0,
+      "timeout": 0,
+      "unsupported": 0
+    },
+    "evidence_slt_lang_update": {
+      "bug": 3,
+      "passed": 24,
+      "percent": 88.89,
+      "run": 27,
+      "skipped": 0,
+      "timeout": 0,
+      "unsupported": 0
+    },
+    "index_between_10_slt_good_0": {
+      "bug": 0,
+      "passed": 4762,
+      "percent": 47.46,
+      "run": 10033,
+      "skipped": 0,
+      "timeout": 0,
+      "unsupported": 5271
+    },
+    "index_commute_10_slt_good_0": {
+      "bug": 0,
+      "passed": 3895,
+      "percent": 38.82,
+      "run": 10034,
+      "skipped": 0,
+      "timeout": 0,
+      "unsupported": 6139
+    },
+    "index_delete_10_slt_good_0": {
+      "bug": 0,
+      "passed": 5994,
+      "percent": 55.86,
+      "run": 10730,
+      "skipped": 0,
+      "timeout": 0,
+      "unsupported": 4736
+    },
+    "index_in_10_slt_good_0": {
+      "bug": 0,
+      "passed": 5300,
+      "percent": 52.82,
+      "run": 10035,
+      "skipped": 0,
+      "timeout": 0,
+      "unsupported": 4735
+    },
+    "index_orderby_10_slt_good_0": {
+      "bug": 0,
+      "passed": 3899,
+      "percent": 38.78,
+      "run": 10053,
+      "skipped": 0,
+      "timeout": 0,
+      "unsupported": 6154
+    },
+    "index_orderby_nosort_10_slt_good_0": {
+      "bug": 840,
+      "passed": 3343,
+      "percent": 33.25,
+      "run": 10053,
+      "skipped": 0,
+      "timeout": 0,
+      "unsupported": 5870
+    },
+    "index_random_10_slt_good_0": {
+      "bug": 246,
+      "passed": 5074,
+      "percent": 50.58,
+      "run": 10032,
+      "skipped": 2140,
+      "timeout": 0,
+      "unsupported": 4712
+    },
+    "index_view_10_slt_good_1": {
+      "bug": 0,
+      "passed": 402,
+      "percent": 5.63,
+      "run": 7135,
+      "skipped": 1065,
+      "timeout": 0,
+      "unsupported": 6733
+    },
+    "random_aggregates_slt_good_0": {
+      "bug": 1577,
+      "passed": 5725,
+      "percent": 57.18,
+      "run": 10012,
+      "skipped": 3910,
+      "timeout": 0,
+      "unsupported": 2710
+    },
+    "random_expr_slt_good_0": {
+      "bug": 0,
+      "passed": 12,
+      "percent": 0.12,
+      "run": 10012,
+      "skipped": 5414,
+      "timeout": 0,
+      "unsupported": 10000
+    },
+    "random_groupby_slt_good_0": {
+      "bug": 1713,
+      "passed": 5596,
+      "percent": 55.89,
+      "run": 10012,
+      "skipped": 547,
+      "timeout": 0,
+      "unsupported": 2703
+    },
+    "random_select_slt_good_0": {
+      "bug": 1528,
+      "passed": 5900,
+      "percent": 58.93,
+      "run": 10012,
+      "skipped": 1072,
+      "timeout": 0,
+      "unsupported": 2584
+    },
+    "select1": {
+      "bug": 43,
+      "passed": 196,
+      "percent": 19.01,
+      "run": 1031,
+      "skipped": 0,
+      "timeout": 0,
+      "unsupported": 792
+    },
+    "select2": {
+      "bug": 0,
+      "passed": 217,
+      "percent": 21.05,
+      "run": 1031,
+      "skipped": 0,
+      "timeout": 0,
+      "unsupported": 814
+    },
+    "select3": {
+      "bug": 0,
+      "passed": 723,
+      "percent": 21.58,
+      "run": 3351,
+      "skipped": 0,
+      "timeout": 0,
+      "unsupported": 2628
+    },
+    "select4": {
+      "bug": 0,
+      "passed": 1042,
+      "percent": 27.02,
+      "run": 3857,
+      "skipped": 0,
+      "timeout": 0,
+      "unsupported": 2815
+    },
+    "select5": {
+      "bug": 0,
+      "passed": 704,
+      "percent": 49.03,
+      "run": 1436,
+      "skipped": 0,
+      "timeout": 0,
+      "unsupported": 732
+    }
+  }
+}
