@@ -253,8 +253,93 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _build_serve_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="nanosql serve",
+        description=(
+            "Sirve una base de datos nanosql por el protocolo de red de PostgreSQL (v3): "
+            "psql, psycopg, SQLAlchemy y cualquier cliente de Postgres pueden conectarse."
+        ),
+    )
+    parser.add_argument("database", help="directorio de la base de datos, o :memory:")
+    parser.add_argument("--host", default="127.0.0.1", help="interfaz (por defecto 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=5432, help="puerto TCP (por defecto 5432)")
+    parser.add_argument(
+        "--auth",
+        choices=["trust", "scram-sha-256"],
+        default="trust",
+        help="método de autenticación (por defecto trust)",
+    )
+    parser.add_argument(
+        "--user",
+        action="append",
+        default=[],
+        metavar="USUARIO[:CONTRASEÑA]",
+        help=(
+            "usuario para scram-sha-256 (repetible); sin ':CONTRASEÑA' se lee de la "
+            "variable de entorno NANOSQL_PASSWORD"
+        ),
+    )
+    parser.add_argument("--backend", choices=["btree", "lsm"], default=None)
+    parser.add_argument(
+        "--isolation",
+        choices=["read_committed", "repeatable_read", "serializable"],
+        default="read_committed",
+        help="aislamiento por defecto de las sesiones (por defecto read_committed, como Postgres)",
+    )
+    parser.add_argument("--log-level", default="INFO", help="nivel de logging (DEBUG muestra SQL)")
+    return parser
+
+
+def serve_main(argv: Sequence[str]) -> int:
+    import logging
+    import os
+
+    from .pgwire import PgServer
+
+    args = _build_serve_parser().parse_args(argv)
+    logging.basicConfig(
+        level=getattr(logging, str(args.log_level).upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    users: dict[str, str] = {}
+    for spec in args.user:
+        name, sep, password = spec.partition(":")
+        if not sep:
+            password = os.environ.get("NANOSQL_PASSWORD", "")
+            if not password:
+                print(f"Error: falta la contraseña de '{name}' (NANOSQL_PASSWORD)", file=sys.stderr)
+                return 2
+        users[name] = password
+    try:
+        server = PgServer(
+            args.database,
+            host=args.host,
+            port=args.port,
+            auth=args.auth,
+            users=users,
+            backend=args.backend,
+            isolation_level=args.isolation,
+        )
+    except (ValueError, OSError, NanosqlError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    host, port = server.address
+    print(f"nanosql {__version__} sirviendo {args.database} en {host}:{port} (auth={args.auth})")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.stop()
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments[:1] == ["serve"]:
+        return serve_main(arguments[1:])
+    args = _build_parser().parse_args(arguments)
     if args.benchmark:
         from .benchmark import run_benchmark
 
