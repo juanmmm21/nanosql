@@ -72,7 +72,7 @@ _ISOLATION_NAMES = {
     "repeatable read": "repeatable_read",
     "serializable": "serializable",
 }
-_WRITE_HEADS = frozenset({"INSERT", "UPDATE", "DELETE", "CREATE"})
+_WRITE_HEADS = frozenset({"INSERT", "UPDATE", "DELETE", "CREATE", "DROP"})
 
 
 class _FatalError(Exception):
@@ -140,6 +140,8 @@ def _command_tag(result: StatementResult) -> str:
         return "CREATE TABLE"
     if kind == "create_index":
         return "CREATE INDEX"
+    if kind == "drop_table":
+        return "DROP TABLE"
     return kind.upper()
 
 

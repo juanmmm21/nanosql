@@ -123,6 +123,13 @@ class Catalog:
                 )
         self.indexes[index.name] = index
 
+    def drop_table(self, name: str) -> None:
+        """Retira la tabla y todos sus índices del esquema."""
+        self.table(name)  # error tipado si no existe
+        del self.tables[name]
+        for index_name in [i.name for i in self.indexes.values() if i.table == name]:
+            del self.indexes[index_name]
+
     def indexes_of(self, table_name: str) -> tuple[IndexSchema, ...]:
         return tuple(idx for idx in self.indexes.values() if idx.table == table_name)
 

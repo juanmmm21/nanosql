@@ -169,6 +169,7 @@ def bind_statement(stmt: pm.Statement, params: Sequence[ColumnValue] | None) -> 
             table=stmt.table,
             columns=stmt.columns,
             rows=tuple(tuple(_bind_expr(e, binder) for e in row) for row in stmt.rows),
+            source=_bind_select(stmt.source, binder) if stmt.source is not None else None,
         )
     elif isinstance(stmt, pm.UpdateStatement):
         bound = pm.UpdateStatement(
@@ -181,7 +182,9 @@ def bind_statement(stmt: pm.Statement, params: Sequence[ColumnValue] | None) -> 
         )
     elif isinstance(stmt, pm.DeleteStatement):
         bound = pm.DeleteStatement(table=stmt.table, where=_optional(stmt.where, binder))
-    elif isinstance(stmt, pm.CreateTableStatement | pm.CreateIndexStatement):
+    elif isinstance(
+        stmt, pm.CreateTableStatement | pm.CreateIndexStatement | pm.DropTableStatement
+    ):
         if params:
             raise ProgrammingError("el DDL no admite parámetros '?'")
         bound = stmt

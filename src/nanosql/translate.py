@@ -18,7 +18,8 @@ módulos, verificado aquí en el arranque del import, no confiado a fe ciega).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field, replace
 
 import cost_based_query_optimizer.models as om
 import cost_based_query_optimizer.plan as oplan
@@ -146,10 +147,34 @@ class TranslatedSelect:
 
     statement: om.SelectStatement
     hidden_columns: tuple[str, ...] = ()
+    # alias interno → nombre visible, para nombres de salida repetidos
+    output_names: dict[str, str] = field(default_factory=dict)
+
+
+def _ordinal_targets(
+    stmt: pm.SelectStatement, star_columns: Mapping[str, Sequence[str]] | None
+) -> list[om.Expression] | None:
+    """Clave de ordenación para cada posición de salida (1, 2, ...), en el
+    orden de la lista SELECT. `*` se expande con las columnas de cada tabla
+    del FROM/JOIN (cualificadas como las expone el proyector). Devuelve None
+    si hay un `*` y no se conoce el esquema."""
+    targets: list[om.Expression] = []
+    for item in stmt.columns:
+        if isinstance(item.expression, pm.Star):
+            if star_columns is None:
+                return None
+            for table in [stmt.from_table] + [join.table for join in stmt.joins]:
+                qualifier = table.alias or table.name
+                for column in star_columns.get(table.name, ()):
+                    targets.append(om.ColumnRef(name=column, table=qualifier))
+        else:
+            targets.append(om.ColumnRef(name=_select_item_output_name(item)))
+    return targets
 
 
 def _normalize_order_by(
     stmt: pm.SelectStatement,
+    star_columns: Mapping[str, Sequence[str]] | None = None,
 ) -> tuple[tuple[om.OrderByItem, ...], tuple[om.SelectItem, ...], tuple[str, ...]]:
     """Reescribe cada clave de `ORDER BY` como referencia a una columna de
     SALIDA del `SELECT`, y devuelve `(order_by, items_extra, nombres_ocultos)`.
@@ -181,6 +206,25 @@ def _normalize_order_by(
         expr = order_item.expression
         direction = om.OrderDirection[order_item.direction.name]
         replacement: om.Expression | None = None
+        if isinstance(expr, pm.Literal) and expr.literal_type is pm.LiteralType.INTEGER:
+            # SQL-92: un entero sin signo en ORDER BY es la POSICIÓN de una
+            # columna de salida, no una constante. Tratarlo como constante
+            # (ordenar por "1") devolvía filas sin ordenar en silencio.
+            targets = _ordinal_targets(stmt, star_columns)
+            if targets is None:
+                raise NotSupportedError(
+                    "ORDER BY por posición con SELECT * requiere el esquema de las tablas"
+                )
+            ordinal = expr.value
+            assert isinstance(ordinal, int)
+            if not 1 <= ordinal <= len(targets):
+                raise ProgrammingError(
+                    f"la posición {ordinal} de ORDER BY no está en la lista SELECT "
+                    f"(hay {len(targets)} columnas)",
+                    sqlstate="42P10",
+                )
+            normalized.append(om.OrderByItem(expression=targets[ordinal - 1], direction=direction))
+            continue
         for item, output_name in named_items:
             if item.expression == expr:
                 replacement = om.ColumnRef(name=output_name)
@@ -188,6 +232,19 @@ def _normalize_order_by(
         if replacement is None and isinstance(expr, pm.ColumnRef) and expr.table is None:
             if expr.name in output_names:
                 replacement = om.ColumnRef(name=expr.name)
+        if replacement is None and isinstance(expr, pm.ColumnRef):
+            # Columna de un `*` ya expandido: `ORDER BY col` o `ORDER BY t.col`
+            # contra el item `t.col AS "t.col"`.
+            for item, output_name in named_items:
+                candidate = item.expression
+                if (
+                    isinstance(candidate, pm.ColumnRef)
+                    and candidate.name == expr.name
+                    and expr.table in (None, candidate.table)
+                    and output_name == f"{candidate.table}.{candidate.name}"
+                ):
+                    replacement = om.ColumnRef(name=output_name)
+                    break
         if replacement is None and has_star:
             # Con `SELECT *` las columnas de origen atraviesan el proyector
             # con su nombre cualificado: la clave original se resuelve tal
@@ -212,8 +269,15 @@ def _normalize_order_by(
     return tuple(normalized), tuple(extra_items), tuple(hidden_names)
 
 
-def select_to_optimizer(stmt: pm.SelectStatement) -> TranslatedSelect:
-    order_by, extra_items, hidden_names = _normalize_order_by(stmt)
+def select_to_optimizer(
+    stmt: pm.SelectStatement, star_columns: Mapping[str, Sequence[str]] | None = None
+) -> TranslatedSelect:
+    """`star_columns` (tabla → columnas) sólo hace falta para resolver
+    `ORDER BY <posición>` cuando la lista SELECT contiene `*`."""
+    if star_columns is not None:
+        stmt = _expand_star(stmt, star_columns)
+    stmt, renamed = _disambiguate_output_names(stmt)
+    order_by, extra_items, hidden_names = _normalize_order_by(stmt, star_columns)
     columns = tuple(
         om.SelectItem(expression=expression_to_optimizer(item.expression), alias=item.alias)
         for item in stmt.columns
@@ -237,7 +301,65 @@ def select_to_optimizer(stmt: pm.SelectStatement) -> TranslatedSelect:
         limit=stmt.limit,
         offset=stmt.offset,
     )
-    return TranslatedSelect(statement=statement, hidden_columns=hidden_names)
+    return TranslatedSelect(statement=statement, hidden_columns=hidden_names, output_names=renamed)
+
+
+def _expand_star(
+    stmt: pm.SelectStatement, star_columns: Mapping[str, Sequence[str]]
+) -> pm.SelectStatement:
+    """`*` → columnas explícitas en el orden del FROM/JOIN y de definición
+    de cada tabla, con el nombre de salida cualificado de siempre (`t.col`).
+
+    SQL fija ese orden; dejar el `*` al plan devolvía las columnas en el
+    orden que eligiera el optimizador (tras reordenar un join, `b` antes que
+    `a`) o en el de las claves de un GROUP BY. Expandirlo aquí, donde sí se
+    conoce el esquema, hace el orden independiente del plan."""
+    if not any(isinstance(item.expression, pm.Star) for item in stmt.columns):
+        return stmt
+    items: list[pm.SelectItem] = []
+    for item in stmt.columns:
+        if not isinstance(item.expression, pm.Star):
+            items.append(item)
+            continue
+        for table in [stmt.from_table] + [join.table for join in stmt.joins]:
+            qualifier = table.alias or table.name
+            for column in star_columns.get(table.name, ()):
+                items.append(
+                    pm.SelectItem(
+                        expression=pm.ColumnRef(name=column, table=qualifier),
+                        alias=f"{qualifier}.{column}",
+                    )
+                )
+    return replace(stmt, columns=tuple(items))
+
+
+def _disambiguate_output_names(
+    stmt: pm.SelectStatement,
+) -> tuple[pm.SelectStatement, dict[str, str]]:
+    """SQL permite nombres de salida repetidos (`SELECT 1 AS c, x AS c`,
+    `SELECT a, a`), pero el esquema de un batch del ejecutor indexa por
+    nombre. Las repeticiones se proyectan con un alias interno único y el
+    engine restaura el nombre visible al devolver el resultado. Una
+    referencia por nombre en ORDER BY sigue resolviendo a la primera
+    aparición (comportamiento de SQLite)."""
+    seen: set[str] = set()
+    renamed: dict[str, str] = {}
+    items: list[pm.SelectItem] = []
+    for position, item in enumerate(stmt.columns):
+        if isinstance(item.expression, pm.Star):
+            items.append(item)
+            continue
+        name = _select_item_output_name(item)
+        if name in seen:
+            internal = f"__dup_{position}__"
+            renamed[internal] = name
+            items.append(pm.SelectItem(expression=item.expression, alias=internal))
+            continue
+        seen.add(name)
+        items.append(item)
+    if not renamed:
+        return stmt, renamed
+    return replace(stmt, columns=tuple(items)), renamed
 
 
 # ---------------------------------------------------------------------------

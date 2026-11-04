@@ -330,6 +330,8 @@ def _statement_expressions(stmt: pm.Statement) -> Iterator[pm.Expression]:
     elif isinstance(stmt, pm.InsertStatement):
         for row in stmt.rows:
             yield from row
+        if stmt.source is not None:
+            yield from _select_expressions(stmt.source)
     elif isinstance(stmt, pm.UpdateStatement):
         for assignment in stmt.assignments:
             yield assignment.value
@@ -364,6 +366,8 @@ def statement_tables(stmt: pm.Statement) -> list[str]:
         return tables
     if isinstance(stmt, pm.InsertStatement | pm.UpdateStatement | pm.DeleteStatement):
         tables.append(stmt.table)
+    if isinstance(stmt, pm.InsertStatement) and stmt.source is not None:
+        tables.extend(statement_tables(stmt.source))
     for expr in _statement_expressions(stmt):
         for subquery in _iter_subqueries(expr):
             tables.extend(_subquery_tables(subquery.statement))
@@ -379,9 +383,13 @@ def _outer_scope(stmt: pm.Statement, catalog: Catalog) -> tuple[_Scope, ...]:
         schema = catalog.tables.get(stmt.table)
         columns = frozenset(schema.column_names()) if schema is not None else frozenset()
         return (_Scope(qualifiers=frozenset({stmt.table}), columns=columns),)
-    # INSERT: sus VALUES no ven ninguna tabla externa — una referencia de
-    # columna dentro de una subconsulta de INSERT solo puede ser de la
-    # propia subconsulta.
+    if isinstance(stmt, pm.InsertStatement) and stmt.source is not None:
+        # INSERT ... SELECT: las subconsultas viven dentro del SELECT origen
+        # y su ámbito externo es el de ese SELECT.
+        return (_scope_of(stmt.source, catalog),)
+    # INSERT ... VALUES: sus VALUES no ven ninguna tabla externa — una
+    # referencia de columna dentro de una subconsulta de INSERT solo puede
+    # ser de la propia subconsulta.
     return ()
 
 
@@ -412,6 +420,11 @@ def expand_statement(
             columns=stmt.columns,
             rows=tuple(
                 tuple(_expand_expression(e, catalog, run_select) for e in row) for row in stmt.rows
+            ),
+            source=(
+                _expand_select(stmt.source, catalog, run_select)
+                if stmt.source is not None
+                else None
             ),
         )
     if isinstance(stmt, pm.UpdateStatement):

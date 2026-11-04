@@ -25,6 +25,7 @@ tabla con el `RLock` en mano bloquearía el commit que debe liberarlo.
 
 from __future__ import annotations
 
+import math
 import threading
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -235,11 +236,16 @@ def evaluate_constant(expr: pm.Expression) -> ColumnValue:
         if op is pm.BinaryOperator.DIV:
             if right == 0:
                 raise DataError("división por cero en expresión constante", sqlstate="22012")
+            if isinstance(left, int) and isinstance(right, int):
+                # Misma semántica que el ejecutor: división entera truncada.
+                return _truncated_quotient(left, right)
             return left / right
         if op is pm.BinaryOperator.MOD:
             if right == 0:
                 raise DataError("módulo por cero en expresión constante", sqlstate="22012")
-            return left % right
+            if isinstance(left, int) and isinstance(right, int):
+                return left - right * _truncated_quotient(left, right)
+            return math.fmod(left, right)
         raise ProgrammingError(
             f"el operador {op.name} no está permitido en una expresión constante"
         )
@@ -247,6 +253,12 @@ def evaluate_constant(expr: pm.Expression) -> ColumnValue:
         "sólo se admiten expresiones constantes en esta posición "
         f"(encontrado {type(expr).__name__})"
     )
+
+
+def _truncated_quotient(left: int, right: int) -> int:
+    """División entera truncada hacia cero (SQL), no la `//` de Python."""
+    quotient = abs(left) // abs(right)
+    return -quotient if (left < 0) != (right < 0) else quotient
 
 
 class DatabaseEngine:
@@ -600,6 +612,11 @@ class DatabaseEngine:
                 with self._lock:
                     self._ensure_open()
                     return self._execute_create_index(ddl_owner, stmt)
+            if isinstance(stmt, pm.DropTableStatement):
+                self._acquire_table_locks(ddl_owner, [stmt.table], LockMode.EXCLUSIVE)
+                with self._lock:
+                    self._ensure_open()
+                    return self._execute_drop_table(stmt)
             raise InternalError(f"DDL no enrutable: {type(stmt).__name__}")
         finally:
             self.rollback(ddl_owner)
@@ -632,7 +649,7 @@ class DatabaseEngine:
         tables = [stmt.from_table.name] + [join.table.name for join in stmt.joins]
         for table in tables:
             self._catalog.table(table)  # existencia; error tipado si falta
-        translated = select_to_optimizer(stmt)
+        translated = select_to_optimizer(stmt, self._star_columns(tables))
         batch = self._run_select_plan(txn_id, translated.statement, tables, include_rowid=False)
         hidden = frozenset(translated.hidden_columns)
         rows = _batch_to_rows(batch, exclude=hidden)
@@ -640,11 +657,14 @@ class DatabaseEngine:
         types = tuple(batch.schema.type_of(name).name for name in visible)
         return StatementResult(
             kind="select",
-            columns=tuple(visible),
+            columns=tuple(translated.output_names.get(name, name) for name in visible),
             column_types=types,
             rows=rows,
             rowcount=len(rows),
         )
+
+    def _star_columns(self, tables: list[str]) -> dict[str, tuple[str, ...]]:
+        return {name: self._catalog.table(name).column_names() for name in tables}
 
     def _optimize_select(
         self, opt_select: om.SelectStatement, tables: list[str], *, include_rowid: bool
@@ -679,7 +699,7 @@ class DatabaseEngine:
             tables = [stmt.from_table.name] + [join.table.name for join in stmt.joins]
             for table in tables:
                 self._catalog.table(table)
-            translated = select_to_optimizer(stmt)
+            translated = select_to_optimizer(stmt, self._star_columns(tables))
             result = self._optimize_select(translated.statement, tables, include_rowid=False)
         text = optimizer_explain(result.physical_plan)
         rows: list[tuple[ColumnValue, ...]] = [(line,) for line in text.splitlines()]
@@ -767,17 +787,34 @@ class DatabaseEngine:
         else:
             target_columns = table.column_names()
 
-        new_rows: list[dict[str, ColumnValue]] = []
+        provided_rows: list[dict[str, ColumnValue]] = []
+        if stmt.source is not None:
+            # INSERT ... SELECT: la consulta origen corre por el pipeline
+            # completo bajo la MISMA transacción (mismo snapshot MVCC); sus
+            # filas se insertan con las mismas reglas que un VALUES.
+            selected = self._execute_select(txn_id, stmt.source)
+            if len(selected.columns) != len(target_columns):
+                raise ProgrammingError(
+                    f"INSERT espera {len(target_columns)} columnas y el SELECT devuelve "
+                    f"{len(selected.columns)}",
+                    sqlstate="42601",
+                )
+            provided_rows = [dict(zip(target_columns, row, strict=True)) for row in selected.rows]
         for row_exprs in stmt.rows:
             if len(row_exprs) != len(target_columns):
                 raise ProgrammingError(
                     f"INSERT espera {len(target_columns)} valores por fila, "
                     f"recibidos {len(row_exprs)}"
                 )
-            provided = {
-                name: evaluate_constant(expr)
-                for name, expr in zip(target_columns, row_exprs, strict=True)
-            }
+            provided_rows.append(
+                {
+                    name: evaluate_constant(expr)
+                    for name, expr in zip(target_columns, row_exprs, strict=True)
+                }
+            )
+
+        new_rows: list[dict[str, ColumnValue]] = []
+        for provided in provided_rows:
             row: dict[str, ColumnValue] = {}
             for column in table.columns:
                 if column.name in provided:
@@ -972,7 +1009,8 @@ class DatabaseEngine:
             table.column(assignment.column)
             if assignment.column in assigned_names:
                 raise ProgrammingError(
-                    f"la columna '{assignment.column}' aparece dos veces en el SET"
+                    f"la columna '{assignment.column}' aparece dos veces en el SET",
+                    sqlstate="42601",
                 )
             if _contains_aggregate(assignment.value):
                 raise ProgrammingError("las funciones agregadas no están permitidas en SET")
@@ -1200,6 +1238,36 @@ class DatabaseEngine:
         )
         self._persist_catalog()
         return StatementResult(kind="create_index", rowcount=0)
+
+    def _execute_drop_table(self, stmt: pm.DropTableStatement) -> StatementResult:
+        """`DROP TABLE` bajo el lock EXCLUSIVE de la tabla (ninguna
+        transacción en vuelo la está usando).
+
+        Orden deliberado para la recuperación ante fallos: primero se borran
+        todas las filas en una transacción normal (WAL + commit: duradero),
+        y sólo después se retira el esquema del catálogo. Un crash entre
+        ambos pasos deja la tabla vacía pero existente (basta repetir el
+        DROP); el orden inverso podría dejar filas huérfanas que una futura
+        `CREATE TABLE` con el mismo nombre "resucitaría". Los rowids no se
+        reutilizan (el contador de la tabla no se reinicia) y el GC de MVCC
+        poda las versiones borradas más tarde, como con cualquier DELETE."""
+        if stmt.table not in self._catalog.tables:
+            if stmt.if_exists:
+                return StatementResult(kind="drop_table", rowcount=0)
+            raise ProgrammingError(f"la tabla '{stmt.table}' no existe", sqlstate="42P01")
+        txn = self.begin_transaction(IsolationLevel.READ_COMMITTED)
+        try:
+            for rowid, _ in self._visible_table_rows(txn, stmt.table):
+                self._mvcc.delete(txn, make_row_id(stmt.table, rowid))
+                self._record_write(txn, stmt.table, rowid)
+        except BaseException:
+            self.rollback(txn)
+            raise
+        self.commit(txn)
+        self._catalog.drop_table(stmt.table)
+        self._live_counts.pop(stmt.table, None)
+        self._persist_catalog()
+        return StatementResult(kind="drop_table", rowcount=0)
 
     def _persist_catalog(self) -> None:
         if self._path is not None:

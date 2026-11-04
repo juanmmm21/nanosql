@@ -507,7 +507,10 @@ class Connection:
         return StatementResult(kind="rollback", rowcount=0)
 
     def _execute_parsed(self, engine: DatabaseEngine, statement: pm.Statement) -> StatementResult:
-        if isinstance(statement, pm.CreateTableStatement | pm.CreateIndexStatement):
+        if isinstance(
+            statement,
+            pm.CreateTableStatement | pm.CreateIndexStatement | pm.DropTableStatement,
+        ):
             # DDL: confirma la transacción abierta (autocommit de DDL) y
             # ejecuta fuera de transacción de usuario.
             self.commit()
