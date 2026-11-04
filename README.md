@@ -461,6 +461,48 @@ models partitions and connection resets but not packet delay or
 reordering, and the harness and all nodes share one machine and one
 clock.
 
+## Crash safety under faults
+
+Two layers of evidence, both measured in this session:
+
+* **Disk-level faults, in `write-ahead-log-recovery`.** The WAL now does all
+  its I/O through a pluggable file layer, and its test suite crashes it
+  before *every* I/O operation of small workloads against a disk model with
+  sector-granular torn writes, reordering of unsynchronised writes, a lying
+  `fsync` and non-durable directory metadata, checking every possible
+  surviving subset (183 crash points / 404 disk images exhaustively, plus
+  random crashes on 60-transaction workloads and crash-recover-continue
+  restarts). It found and fixed four real bugs: no directory `fsync` after
+  creating or compacting the log, appending behind an unreadable tail (and
+  failing to reopen a log whose last record had a bad CRC), and undoing
+  aborted or interrupted transactions on top of later commits (now handled
+  with compensation records). See that repository's README.
+* **Process-level `kill -9`, here.** `python -m nanosql.crashtest campaign`
+  (and `tests/test_kill9.py`, 150 kills per backend on every test run)
+  starts a real writer process that commits multi-row transactions — batch
+  *b* inserts `1 + b % 3` rows into `ledger` and adds the same number to
+  the single row of `totals`, in one transaction, printing `ack b` once
+  `commit()` returns — with checkpoints and version GC forced every few
+  commits, kills it with `SIGKILL` after a random delay (0–400 ms), reopens
+  the database (real recovery), checks the invariants and restarts the
+  writer where the committed data ends. Invariants: every acknowledged
+  batch is present; every present batch has exactly its rows and
+  `totals.n` equals the row count (nothing half-applied); batches are
+  exactly `1..m` (no holes); the database always opens.
+
+| backend | kills | batches acknowledged | batches recovered | violations | time |
+|---|---:|---:|---:|---:|---:|
+| btree | 300 | 1,253 | 1,254 | 0 | 139 s |
+| lsm | 300 | 1,066 | 1,066 | 0 | 140 s |
+
+(One more batch recovered than acknowledged means a commit that reached
+disk but was killed before printing its `ack` — allowed.) The same
+campaign against the previous `write-ahead-log-recovery` release (100
+kills per backend) also passed: `SIGKILL` does not lose the operating
+system's page cache, so it cannot tear writes; the WAL bugs above need a
+power-loss-style fault, which is what the fault-injection layer models.
+Reports in `docs/results/kill9-*.json`.
+
 ## PostgreSQL wire protocol (`nanosql serve`)
 
 `nanosql serve` exposes a database over the PostgreSQL frontend/backend

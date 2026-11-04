@@ -16,7 +16,7 @@ authors = [{ name = "Juan Martos Cuevas", email = "martoscuevasjuan@gmail.com" }
 # nanosql es la única pieza del ecosistema autorizada a importarlos: los diez
 # repos se prohíben imports cruzados entre sí y la integración real vive aquí.
 dependencies = [
-    "write-ahead-log-recovery @ git+https://github.com/juanmmm21/write-ahead-log-recovery.git",
+    "write-ahead-log-recovery @ git+https://github.com/juanmmm21/write-ahead-log-recovery.git@feat/strata-roadmap",
     "bplus-tree-storage-engine @ git+https://github.com/juanmmm21/bplus-tree-storage-engine.git",
     "lsm-tree-engine @ git+https://github.com/juanmmm21/lsm-tree-engine.git",
     "mvcc-transaction-manager @ git+https://github.com/juanmmm21/mvcc-transaction-manager.git",
