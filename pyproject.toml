@@ -16,20 +16,20 @@ authors = [{ name = "Juan Martos Cuevas", email = "martoscuevasjuan@gmail.com" }
 # nanosql es la única pieza del ecosistema autorizada a importarlos: los diez
 # repos se prohíben imports cruzados entre sí y la integración real vive aquí.
 dependencies = [
-    "write-ahead-log-recovery @ git+https://github.com/juanmmm21/write-ahead-log-recovery.git@feat/strata-roadmap",
-    "bplus-tree-storage-engine @ git+https://github.com/juanmmm21/bplus-tree-storage-engine.git@feat/strata-roadmap",
+    "write-ahead-log-recovery @ git+https://github.com/juanmmm21/write-ahead-log-recovery.git@v0.2.0",
+    "bplus-tree-storage-engine @ git+https://github.com/juanmmm21/bplus-tree-storage-engine.git@v0.2.0",
     "lsm-tree-engine @ git+https://github.com/juanmmm21/lsm-tree-engine.git",
-    "mvcc-transaction-manager @ git+https://github.com/juanmmm21/mvcc-transaction-manager.git@feat/strata-roadmap",
+    "mvcc-transaction-manager @ git+https://github.com/juanmmm21/mvcc-transaction-manager.git@v0.2.0",
     "lock-manager-deadlock-detector @ git+https://github.com/juanmmm21/lock-manager-deadlock-detector.git",
-    "sql-query-parser @ git+https://github.com/juanmmm21/sql-query-parser.git@feat/strata-roadmap",
-    "cost-based-query-optimizer @ git+https://github.com/juanmmm21/cost-based-query-optimizer.git@feat/strata-roadmap",
-    "vectorized-execution-engine @ git+https://github.com/juanmmm21/vectorized-execution-engine.git@feat/strata-roadmap",
+    "sql-query-parser @ git+https://github.com/juanmmm21/sql-query-parser.git@v0.2.0",
+    "cost-based-query-optimizer @ git+https://github.com/juanmmm21/cost-based-query-optimizer.git@v0.2.0",
+    "vectorized-execution-engine @ git+https://github.com/juanmmm21/vectorized-execution-engine.git@v0.2.0",
 ]
 
 [project.optional-dependencies]
 # Modo distribuido opcional (no requerido para el uso embebido de nodo único).
 distributed = [
-    "raft-replication-log @ git+https://github.com/juanmmm21/raft-replication-log.git@feat/strata-roadmap",
+    "raft-replication-log @ git+https://github.com/juanmmm21/raft-replication-log.git@v0.2.0",
     "distributed-query-router @ git+https://github.com/juanmmm21/distributed-query-router.git",
 ]
 # Clientes reales de PostgreSQL para los tests del servidor de protocolo
@@ -38,7 +38,7 @@ pgclients = ["psycopg[binary]>=3.1", "sqlalchemy>=2.0"]
 # Acelerador Rust opcional del códec de páginas del B+Tree (rueda abi3 de
 # maturin; sin él, el mismo código en Python puro da resultados idénticos).
 native = [
-    "bplus-tree-storage-engine-native @ git+https://github.com/juanmmm21/bplus-tree-storage-engine.git@feat/strata-roadmap#subdirectory=native",
+    "bplus-tree-storage-engine-native @ git+https://github.com/juanmmm21/bplus-tree-storage-engine.git@v0.2.0#subdirectory=native",
 ]
 # Comparativa de `bench/` (fuera del stack: sqlite3 viene con Python y DuckDB
 # es solo la línea base externa, nunca una dependencia del motor).
