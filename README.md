@@ -362,10 +362,104 @@ would evaluate the subquery against its local rows only, silently producing
 a wrong global membership set (replicated mode has no such restriction —
 every node holds the full database).
 
-Both are in-process simulations (no sockets), matching the scope of their
-underlying repositories: the goal is real protocol integration —
-quorum commits, leader failover, database-as-state-machine snapshots,
-partial results on shard failure — not multi-machine deployment.
+Both are in-process simulations (no sockets): the goal there is protocol
+integration — quorum commits, leader failover, database-as-state-machine
+snapshots, partial results on shard failure. The real multi-process
+cluster is described next.
+
+## Real cluster and chaos testing (`nanosql cluster`)
+
+`nanosql cluster start --nodes 3` launches a real cluster: one process per
+node (3–5, static membership), Raft over TCP with a persistent, fsynced
+log per node (`raft-replication-log`'s `NetworkNode`/`DiskStorage`), and a
+replicated nanosql database as the state machine, rebuilt on restart from
+the node's snapshot and log.
+
+```python
+from nanosql.cluster import ClusterClient
+
+# endpoints as printed by `nanosql cluster start`
+client = ClusterClient([("127.0.0.1", 7201), ("127.0.0.1", 7202), ("127.0.0.1", 7203)])
+client.execute("CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)")
+client.execute("INSERT INTO kv (k, v) VALUES (?, ?)", (1, "a"))
+client.query("SELECT v FROM kv WHERE k = ?", (1,))  # linearizable read
+```
+
+* **Finding the leader.** Any node answers a follower's
+  `{"redirect": leader}`; the client follows it, rotates on connection
+  errors or `retry`, and raises `IndeterminateError` when its deadline
+  passes without a definitive answer (the operation may or may not have
+  happened). Deterministic SQL errors (e.g. a unique violation) come back
+  as `ClusterSqlError` with their SQLSTATE.
+* **Exactly-once retries.** Every operation carries `(client id,
+  sequence)`; retries reuse it, and the replicated state machine keeps a
+  session table (Raft paper §8) that returns the stored result of an
+  already-applied sequence instead of applying it again — otherwise a
+  retried `UPDATE ... SET n = n + 1` after a lost response would count
+  twice.
+* **Linearizable reads.** Reads go through the log (one quorum round
+  trip); a deposed leader cannot serve stale data. `--unsafe-local-reads`
+  deliberately breaks this (reads served from local state) and exists only
+  to prove that the checker catches the resulting violations.
+
+### Chaos harness and linearizability checker
+
+`nanosql cluster chaos --nodes 3 --duration 600` starts the cluster behind
+**userspace TCP proxies** — one per directed link, so node *i* reaches peer
+*j* through proxy *i→j* — and runs concurrent clients issuing a SQL
+workload of **registers** (`UPDATE registers SET v = ? WHERE k = ?` /
+`SELECT v ...`) and **counters** (`UPDATE counters SET n = n + 1 WHERE k =
+?` / `SELECT n ...`) while a nemesis injects one fault every 2–5 s, held
+for 1.5–4 s:
+
+* `kill-leader` — `SIGKILL` of the current leader, restarted later from its
+  data directory;
+* `partition` — random two-group split by blocking proxies;
+* `partition-leader` — the leader isolated from everyone;
+* `pause` — `SIGSTOP`/`SIGCONT` of a random node.
+
+Every operation is recorded with its invocation and response instants (a
+single monotonic clock in the harness). The history is then checked by
+`nanosql.cluster.linearizability`, a self-contained implementation of the
+**Wing & Gong** algorithm with **Lowe's (linearized-set, state) cache** —
+the variant Porcupine uses — per key (P-compositionality), with register
+and counter models; operations whose outcome is unknown get a return time
+of +∞ and unanswered reads are dropped.
+
+The checker is tested on synthetic histories — concurrent ones, pending
+writes, and **injected violations** (a stale read after a completed
+write, a lost increment, broken real-time order, 150 random linearizable
+histories that must pass until a never-written value is injected) — and on
+a real cluster: `test_cluster.py` isolates the leader of a cluster running
+with `--unsafe-local-reads`, writes on the majority and reads from the old
+leader, and the checker **flags the stale read**; the same scenario with
+reads through the log is linearizable.
+
+### Results
+
+Measured in this session (Intel Xeon @ 2.10 GHz, 4 vCPU, 15 GiB, Linux
+6.18, Python 3.13.18), 6 clients over 4 register and 4 counter keys,
+faults as above; full reports in `docs/results/`:
+
+| cluster | duration | operations (all definite) | faults injected | linearizable | checker time |
+|---|---:|---:|---|---|---:|
+| 3 nodes, seed 101 | 630 s | 188,686 | 22 kill -9 of the leader, 27 partitions, 26 leader isolations, 27 SIGSTOP pauses | **yes**, 8/8 keys | 1.3 s |
+| 5 nodes, seed 202 | 630 s | 155,431 | 19 kill -9 of the leader, 30 partitions, 23 leader isolations, 26 SIGSTOP pauses | **yes**, 8/8 keys | 0.9 s |
+
+No operation ended indeterminate in either run (every client retry
+eventually got a definite answer within its 10 s deadline); p50/p99 latency
+was 13.9/44.1 ms (3 nodes) and 18.2/54.4 ms (5 nodes), with maxima of ~4 s
+during fail-overs. Throughput (300 and 247 ops/s) is that of a pure-Python
+stack with an fsync per Raft append on every node; the 5-node run shared
+the machine with a `kill -9` campaign for part of its duration. CI runs a
+90 s chaos job on every push and fails if the history is not
+linearizable.
+
+Limits, stated plainly: static membership only (no joint consensus), no
+leases or read-index (reads pay a log round trip), the userspace proxy
+models partitions and connection resets but not packet delay or
+reordering, and the harness and all nodes share one machine and one
+clock.
 
 ## PostgreSQL wire protocol (`nanosql serve`)
 
