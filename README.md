@@ -698,7 +698,7 @@ python -m nanosql.sqllogictest tests/sqllogictest/corpus/*.test.gz \
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -e ".[distributed,dev]"
-.venv/bin/pytest              # 232 tests (psql/psycopg/SQLAlchemy ones skip if absent)
+.venv/bin/pytest              # 264 tests (psql/psycopg/SQLAlchemy ones skip if absent)
 .venv/bin/ruff check . && .venv/bin/ruff format --check .
 .venv/bin/mypy --strict src/
 ```
@@ -716,6 +716,121 @@ All ten dependencies ship a `py.typed` marker, so `mypy --strict` checks
 the integration layer against their real signatures with no overrides.
 
 ## Benchmarks
+
+### TPC-H-like comparison with SQLite and DuckDB (`bench/`)
+
+`bench/` compares nanosql — pure Python, and with the optional Rust page
+codec of `bplus-tree-storage-engine` — against SQLite and DuckDB on the
+same generated data. **This is not TPC-H**: `bench/tpch_like.py` is a
+deterministic generator (fixed seed, byte-identical output for a given
+scale) that reproduces the TPC-H schema's main columns, the per-scale row
+ratios and the shape of the queries, without `dbgen`, its text
+distributions or its audit rules. Dates are ISO text so the same SQL runs
+on all four engines. The queries are the TPC-H ones that fit nanosql's
+SQL subset, with the specification's default parameters: Q1, Q3, Q5, Q6,
+Q10, Q18 (its `IN (SELECT … GROUP BY … HAVING …)`), Q12 rewritten without
+`CASE` (`Q12*`), and a primary-key point lookup.
+
+```bash
+pip install -e ".[bench]"            # duckdb; sqlite3 ships with Python
+pip install -e ".[native]"           # optional: the Rust codec (needs a Rust toolchain)
+python bench/run.py --scale 0.01 --repeat 3 --out bench/results.json
+python bench/profile_components.py --scale 0.01   # per-component cProfile shares
+```
+
+Every engine runs in its own subprocess on an in-memory database (for
+nanosql, the B+Tree backend over an in-memory page device), with one
+warm-up run and the median of three timed runs per query. The rows of
+every query are compared across the four engines (floats with a 1e-6
+relative tolerance): **all eight queries returned the same rows on all
+four engines**. Raw timings, every run and the result rows are in
+`bench/results.json` (and `bench/results-reversed.json` for the second
+nanosql run described below).
+
+Measured in this session at scale factor 0.01 (lineitem 60 278 rows,
+orders 15 000, partsupp 8 000, part 2 000, customer 1 500, supplier 100):
+cloud VM with an Intel Xeon @ 2.10 GHz, 4 vCPUs, 15 GiB RAM, Linux 6.18;
+CPython 3.13.18, NumPy 2.5.4, SQLite 3.53.1 (Python's `sqlite3`),
+DuckDB 2.0.0, rustc 1.97.0 + PyO3 0.23.5 + maturin 1.16.0 (release build).
+
+| query (SF 0.01) | nanosql, pure Python (ms) | nanosql + Rust codec (ms) | SQLite (ms) | DuckDB (ms) |
+|---|---:|---:|---:|---:|
+| load (s) | 71.1 | 59.4 | 0.7 | 0.9 |
+| Q1 | 762.8 | 706.9 | 41.3 | 6.0 |
+| Q3 | 7171.9 | 7730.9 | 7.0 | 5.1 |
+| Q5 | 15336.9 | 16846.9 | 6.1 | 6.2 |
+| Q6 | 689.0 | 595.1 | 4.4 | 2.2 |
+| Q10 | 2069.2 | 2282.9 | 5.1 | 6.4 |
+| Q12* | 781.0 | 837.9 | 5.4 | 7.5 |
+| Q18 | 1812.7 | 1752.0 | 6.6 | 5.2 |
+| point | 106.1 | 95.8 | < 0.05 | 0.8 |
+
+How to read it, honestly:
+
+* **nanosql is two to three orders of magnitude slower** than both
+  baselines: from 17–18x behind SQLite on Q1 to 2 500–2 800x on Q5.
+  That is expected for an interpreted engine whose every row goes
+  through MVCC version resolution, a JSON row payload and a B+Tree page
+  codec in Python; the point of the table is to show where it stands, not
+  to compete.
+* **The Rust codec helps where pages are decoded, and only there.** To
+  separate its effect from the VM's noise, the two nanosql engines were
+  run a second time in the opposite order (Rust first;
+  `bench/results-reversed.json`). Consistent in both runs: load −16% and
+  −21% (71.1 → 59.4 s, then 75.1 → 59.2 s), Q1 −7% and −15%, Q6 −14% and
+  −10%. On Q3, Q5, Q10, Q12* and the point lookup the difference changes
+  sign or size between the two runs (Q3: Rust +8%, then +1%; Q10: +10%,
+  then −4%; point: −10%, then +6%), and Q18 (−3%, then −5%) stays inside
+  the spread of its own three runs: those queries do not spend their time
+  in the codec, and the table does not show a speed-up for them.
+* **Q3, Q5 and Q10 are slow because of the plan, not a hot loop.**
+  nanosql has no `ANALYZE` yet and reports `distinct_count = row_count`
+  for every column to the optimizer, so equi-join estimates collapse
+  toward one row along the join chain and the cost model picks nested
+  loop joins over hash joins — every join in the `EXPLAIN` of Q3, Q5 and
+  Q10 is a `NestedLoopJoin`, the lineitem–orders one estimated at 0.1 rows
+  or fewer. Profiled, Q5 spends 84% of its time in the executor, mostly
+  in `RowBatch.take` building nested-loop pairs. Fixing this
+  means real column statistics (a planning change), which no amount of
+  Rust in the executor would replace. It is the next item, not done here.
+* SQLite and DuckDB load through their own bulk paths (`executemany`,
+  `COPY` from CSV); nanosql through 500-row parameterised `INSERT`s, whose
+  SQL text is lexed and parsed in Python (28–39% of the load profile).
+
+#### What was profiled, and what changed because of it
+
+`bench/profile_components.py` attributes cProfile's self time to the
+repository that owns each function (absolute times include the
+profiler's 2–4x overhead; the shares are what matter). Two findings
+drove the work, both measured in this session at the same scale:
+
+1. **Every table scan read the whole database.** Snapshot
+   materialization asked `mvcc-transaction-manager` for every visible row
+   of every table and filtered by row-id prefix in nanosql. The manager now
+   has `scan_range(txn, start, end)` over an optional `RangeRowStore`
+   protocol (`versions_in_range`), which nanosql's durable row store
+   implements as one ordered range scan of the backend (row ids sort by
+   table). Under the profiler, Q5 went from 24.8 s to 18.2 s, Q10 from
+   8.3 s to 3.6 s, Q18 from 9.5 s to 5.7 s and the point lookup from
+   1.57 s to 0.36 s; the storage engine's share in Q5 fell from 9% to 2%.
+2. **The B+Tree page codec was the hottest component code.** During a
+   bulk load (SF 0.005, pure Python) `bplus-tree-storage-engine` took 27%
+   of the self time: every insert descends the tree and decodes the
+   internal pages on its path (`decode_internal_page`, 34.0 s cumulative
+   of 92 s profiled). Scan-bound queries spent 13–19% decoding leaves.
+   That is a tight, self-contained, byte-level loop — the right shape for
+   Rust — so it became the optional PyO3 accelerator described in that
+   repository's README (pure-Python fallback, identical results proven
+   by Hypothesis properties, abi3 wheels built in CI for Linux x86_64 and
+   macOS arm64). With it, the same load profile shows
+   `decode_internal_page` at 9.1 s cumulative and the component's share at
+   16%; what remains is building the Python entry objects.
+
+The parser (load) and the executor's nested loop joins (Q3/Q5) are the
+next hot spots; both are left as they are in this round and documented
+here rather than hidden.
+
+### Built-in micro-benchmark (`nanosql --benchmark`)
 
 `nanosql --benchmark`, Apple Silicon, Python 3.14, 2 000-row table, WAL
 fsync per commit. Full pipeline (parse → optimize → execute → MVCC →
