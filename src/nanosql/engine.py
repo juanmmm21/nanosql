@@ -382,6 +382,13 @@ class DatabaseEngine:
     def catalog(self) -> Catalog:
         return self._catalog
 
+    def catalog_snapshot(self) -> Catalog:
+        """Copia consistente del catálogo, tomada bajo el lock del engine:
+        segura de recorrer desde otro hilo mientras el DDL sigue avanzando
+        (los esquemas son inmutables; sólo se copian los diccionarios)."""
+        with self._lock:
+            return Catalog(tables=dict(self._catalog.tables), indexes=dict(self._catalog.indexes))
+
     # ------------------------------------------------------------------
     # Transacciones
     # ------------------------------------------------------------------

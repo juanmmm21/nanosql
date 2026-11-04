@@ -328,6 +328,8 @@ class Connection:
         registry_key: str | None,
         isolation: IsolationLevel,
         autocommit: bool,
+        *,
+        owns_engine: bool = True,
     ) -> None:
         self._engine: DatabaseEngine | None = engine
         self._registry_key = registry_key
@@ -335,6 +337,7 @@ class Connection:
         self._autocommit = autocommit
         self._txn: TransactionId | None = None
         self._explicit_txn = False
+        self._owns_engine = owns_engine
 
     # -- estado ------------------------------------------------------------
 
@@ -360,6 +363,30 @@ class Connection:
     def cursor(self) -> Cursor:
         self._require_engine()
         return Cursor(self)
+
+    def sibling(
+        self, *, isolation_level: str | None = None, autocommit: bool = False
+    ) -> Connection:
+        """Otra conexión sobre el MISMO engine, con su propia transacción.
+
+        Es lo que usa el servidor de protocolo Postgres para dar a cada
+        sesión de red su conexión: funciona también para `:memory:` (que
+        `connect()` nunca comparte). La conexión hermana no es dueña del
+        engine — cerrarla no lo cierra; lo cierra la conexión original.
+        """
+        engine = self._require_engine()
+        isolation = parse_isolation_level(isolation_level) if isolation_level else self._isolation
+        return Connection(engine, None, isolation, autocommit, owns_engine=False)
+
+    def begin(self, isolation_level: str | None = None) -> None:
+        """`BEGIN` explícito con un nivel de aislamiento opcional para ESTA
+        transacción (el de la conexión no cambia)."""
+        engine = self._require_engine()
+        if self._txn is not None:
+            raise ProgrammingError("ya hay una transacción activa", sqlstate="25001")
+        isolation = parse_isolation_level(isolation_level) if isolation_level else self._isolation
+        self._txn = engine.begin_transaction(isolation)
+        self._explicit_txn = True
 
     def execute(self, sql: str, params: Sequence[ColumnValue] | None = None) -> Cursor:
         """Atajo DB-API: crea un cursor y ejecuta `sql` en él."""
@@ -391,7 +418,8 @@ class Connection:
                 self._txn = None
         finally:
             self._engine = None
-            _release_engine(self._registry_key, engine)
+            if self._owns_engine:
+                _release_engine(self._registry_key, engine)
 
     def __enter__(self) -> Connection:
         return self
