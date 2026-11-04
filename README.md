@@ -775,34 +775,35 @@ load). Per query: one warm-up run and the median of three timed runs. The
 rows of every query are compared across the four engines (floats with a
 1e-6 relative tolerance): **all eight queries returned the same rows on
 all four engines**. Raw timings, every run and the result rows are in
-`bench/results.json`; `bench/results-reversed.json` is a second run of the
-two nanosql engines in the opposite order, and
-`bench/results-before-statistics.json` is the code before the statistics
-and load work below (commit `ba65361`, its own bench script, no `ANALYZE`),
-measured on the same machine for the before/after comparison.
+`bench/`: `results.json` (the table below), `results-reversed.json` (a
+second run of the two nanosql engines in the opposite order), and the two
+"before" runs used for the comparisons further down —
+`results-before-statistics.json` and `results-before-load.json`.
 
 Measured in this session at scale factor 0.01 (lineitem 60 278 rows,
 orders 15 000, partsupp 8 000, part 2 000, customer 1 500, supplier 100):
 cloud VM with an Intel Xeon @ 2.10 GHz, 4 vCPUs, 15 GiB RAM, Linux 6.18;
 CPython 3.13.18, NumPy 2.5.4, SQLite 3.53.1 (Python's `sqlite3`),
 DuckDB 2.0.0, rustc 1.97.0 + PyO3 0.23.5 + maturin 1.16.0 (release build).
-The VM was restarted during the session; every number compared below comes
-from the same instance.
+The VM was restarted twice during the session, so absolute numbers moved
+between instances; **every before/after pair below was measured on a
+single instance**, with the old code checked out next to the new one.
 
 | query (SF 0.01) | nanosql, pure Python (ms) | nanosql + Rust codec (ms) | SQLite (ms) | DuckDB (ms) |
 |---|---:|---:|---:|---:|
-| load + ANALYZE (s) | 50.9 | 27.3 | 0.8 | 1.4 |
-| Q1 | 988.1 | 800.8 | 60.0 | 7.0 |
-| Q3 | 964.5 | 930.8 | 3.3 | 5.4 |
-| Q5 | 1632.1 | 1413.6 | 8.2 | 5.6 |
-| Q6 | 841.5 | 621.2 | 7.9 | 2.3 |
-| Q10 | 1118.5 | 928.1 | 7.5 | 5.6 |
-| Q12* | 859.3 | 752.7 | 10.0 | 7.6 |
-| Q18 | 2130.3 | 2031.5 | 14.1 | 5.8 |
-| point | 182.3 | 102.3 | < 0.01 | 0.9 |
+| load + ANALYZE (s) | 19.0 | 15.6 | 0.7 | 1.0 |
+| Q1 | 1226.8 | 881.7 | 42.8 | 7.1 |
+| Q3 | 1069.5 | 902.7 | 3.8 | 5.6 |
+| Q5 | 1636.1 | 1322.5 | 5.4 | 5.3 |
+| Q6 | 886.2 | 682.4 | 5.1 | 1.9 |
+| Q10 | 1044.2 | 801.1 | 6.2 | 5.7 |
+| Q12* | 935.4 | 858.5 | 6.9 | 6.1 |
+| Q18 | 2183.5 | 2137.2 | 7.5 | 5.2 |
+| point | 113.8 | 99.3 | < 0.01 | 0.9 |
 
-Before and after the optimizer statistics and the load fixes, same
-machine (medians in ms; "after" shows the two runs):
+**Optimizer statistics** — the code before them (commit `ba65361`, no
+`ANALYZE`) against the code with them, same instance (medians in ms;
+"after" shows the two runs):
 
 | | pure Python before | pure Python after | + Rust before | + Rust after |
 |---|---:|---:|---:|---:|
@@ -811,43 +812,53 @@ machine (medians in ms; "after" shows the two runs):
 | Q5 | 17182.9 | 1632.1 / 1339.3 | 18089.1 | 1413.6 / 1349.6 |
 | Q10 | 1967.5 | 1118.5 / 990.1 | 2024.4 | 928.1 / 892.8 |
 
+**Load path** — the code before the second round of load work (nanosql
+`3cf4feb`, `bplus-tree-storage-engine` `a2b469f`, `sql-query-parser`
+`0a6d69e`) against the current code, same instance, runs interleaved
+(before, after, before, after):
+
+| load + ANALYZE (s) | before | after | speed-up |
+|---|---:|---:|---:|
+| pure Python | 48.2 / 43.7 | 19.0 / 17.6 | 2.5x |
+| + Rust codec | 31.4 / 27.5 | 15.6 / 15.6 | 1.8–2.0x |
+
 How to read it, honestly:
 
 * **nanosql is still one to three orders of magnitude slower** than both
-  baselines: from 13–16x behind SQLite on Q1 to 285–295x on Q3 and up to
-  ~365x behind DuckDB on Q6 and Q18; SQLite answers the point lookup in
-  3 µs. That is expected for an interpreted engine whose every row goes
-  through MVCC version resolution, a JSON row payload and a B+Tree page
-  codec in Python; the table shows where it stands, it does not compete.
+  baselines: from 21–29x behind SQLite on Q1 to 240–300x on Q3, Q5 and
+  Q18, up to ~470x behind DuckDB on Q6, and
+  SQLite answers the point lookup in 2 µs. That is expected for an
+  interpreted engine whose every row goes through MVCC version resolution,
+  a JSON row payload and a B+Tree page codec in Python; the table shows
+  where it stands, it does not compete.
 * **Q3, Q5 and Q10 were slow because of the plan, and now are not.** With
   `distinct_count = row_count` for every column, `c_mktsegment =
   'BUILDING'` (5 values in 1 500 rows) was estimated at one row, so every
   join in the `EXPLAIN` of Q3, Q5 and Q10 was a `NestedLoopJoin`. With real
   statistics every one of them is a `HashJoin`: Q3 is 8.1–9.7x faster, Q5
-  10.5–13.4x and Q10 1.8–2.3x, on the same machine.
-* **Loading is 1.6–1.9x faster in pure Python and 2.1–2.2x with Rust.**
-  Two things were wasted per `INSERT`: the unique-constraint check decoded
-  every visible row of the table (quadratic over a bulk load), and the
-  driver lexed each statement three times. With those gone the B+Tree
-  codec is a larger share of what remains, so the Rust codec's load gain
-  grew from 16–21 % to 33–46 % (pure Python → Rust: 50.9 → 27.3 s, then
-  43.3 → 28.9 s).
-* **The single-table queries did not change** (Q1, Q6, Q12*, Q18, the
-  point lookup: same plans). Their run-to-run spread on this VM is about
-  ±20 %, which is why a single run can look slower or faster; an
+  10.5–13.4x and Q10 1.8–2.3x.
+* **Loading got faster in two rounds.** First, unique checks stopped
+  decoding the whole table on every `INSERT` and each statement is lexed
+  once instead of three times (1.6–1.9x in pure Python, 2.1–2.2x with
+  Rust). Then the B+Tree keeps its decoded internal pages for descents,
+  the parser and lexer got equivalence-tested fast paths, and nanosql
+  stopped walking every literal looking for subqueries (2.5x and
+  1.8–2.0x more). Chaining the two same-instance ratios, a load is about
+  4.0–4.7x faster in pure Python and 3.7–4.5x with Rust than at the start
+  of this work.
+* **The Rust codec matters less for loading now**: −18 % and −11 % (it
+  was −33 % to −46 %), because the decoded-page cache removed most of the
+  page decoding it accelerated. On queries it was faster in both runs on
+  Q1 (−28 %, −19 %), Q3, Q5, Q6, Q10 and Q18 (−1 % to −23 %), and changed
+  sign on Q12* and the point lookup.
+* **The single-table queries did not change** with any of this (same
+  plans). Their run-to-run spread on these VMs is about ±20 %; an
   interleaved A/B in separate processes at SF 0.005 (pure Python, two
-  rounds each) gave Q6 377 / 374 ms before vs 384 / 347 ms after, and Q1
-  410 / 476 vs 410 / 442.
-* **The Rust codec, query by query:** faster in both runs on Q3, Q6, Q10,
-  Q18 and the point lookup, by very different amounts (Q6 −26 % / −22 %,
-  Q10 −17 % / −10 %, point −44 % / −6 %, Q3 −3 % / −18 %); on Q1, Q5 and
-  Q12* the sign changes between runs. It helps where pages are decoded and
-  nowhere else.
-* SQLite's numbers now include its `ANALYZE` too. Compared with the run
-  without it on the same machine, it got faster on Q3 (7.9 → 3.3 ms) and
-  slower on Q1 (43.6 → 60.0), Q6 (4.3 → 7.9) and Q18 (7.6 → 14.1); its
-  plans were not inspected, so this is reported, not explained. DuckDB
-  barely moved.
+  rounds) gave Q6 377 / 374 ms before the statistics vs 384 / 347 ms after,
+  and Q1 410 / 476 vs 410 / 442.
+* On the instance of the statistics comparison, SQLite with `ANALYZE` was
+  faster than without it on Q3 (7.9 → 3.3 ms) and slower on Q1, Q6 and
+  Q18; its plans were not inspected, so this is reported, not explained.
 * SQLite and DuckDB load through their own bulk paths (`executemany`,
   `COPY` from CSV); nanosql through 500-row parameterised `INSERT`s.
 
@@ -855,8 +866,8 @@ How to read it, honestly:
 
 `bench/profile_components.py` attributes cProfile's self time to the
 repository that owns each function (absolute times include the
-profiler's 2–4x overhead; the shares are what matter). Four findings
-drove the work, each measured in this session:
+profiler's 2–4x overhead; the shares are what matter). Each change below
+came from a measured finding:
 
 1. **Every table scan read the whole database.** Snapshot
    materialization asked `mvcc-transaction-manager` for every visible row
@@ -866,33 +877,37 @@ drove the work, each measured in this session:
    implements as one ordered range scan of the backend (row ids sort by
    table). Under the profiler, Q5 went from 24.8 s to 18.2 s, Q10 from
    8.3 s to 3.6 s, Q18 from 9.5 s to 5.7 s and the point lookup from
-   1.57 s to 0.36 s; the storage engine's share in Q5 fell from 9% to 2%.
+   1.57 s to 0.36 s.
 2. **The B+Tree page codec was the hottest component code.** During a
    bulk load (SF 0.005, pure Python) `bplus-tree-storage-engine` took 27%
-   of the self time: every insert descends the tree and decodes the
-   internal pages on its path (`decode_internal_page`, 34.0 s cumulative
-   of 92 s profiled). Scan-bound queries spent 13–19% decoding leaves.
-   That is a tight, self-contained, byte-level loop — the right shape for
-   Rust — so it became the optional PyO3 accelerator described in that
-   repository's README (pure-Python fallback, identical results proven
-   by Hypothesis properties, abi3 wheels built in CI for Linux x86_64 and
-   macOS arm64). With it, the same load profile shows
-   `decode_internal_page` at 9.1 s cumulative and the component's share at
-   16%; what remains is building the Python entry objects.
+   of the self time, and scan-bound queries spent 13–19% decoding leaves —
+   a tight byte-level loop, the right shape for Rust, so it became the
+   optional PyO3 accelerator described in that repository's README
+   (pure-Python fallback, identical results proven by Hypothesis
+   properties, abi3 wheels built in CI for Linux x86_64 and macOS arm64).
 3. **Join-heavy queries were a planning problem.** Profiled, Q5 spent 84 %
-   of its time in the executor, mostly in `RowBatch.take` building
-   nested-loop pairs — not a loop worth porting to Rust, but the result of
-   one-row estimates. Real statistics (`ANALYZE`, above) fixed the plans.
-4. **The load did avoidable work.** The same SF 0.005 load profile showed
-   `_check_unique_constraints` at 14.0 s cumulative of 83 s and the lexer
-   at 24.8 s, called three times per statement. With in-memory unique-key
-   indexes and a single lexer pass they take 0.13 s and 8.2 s, and the
-   profiled load fell to 54 s.
+   of its time in the executor building nested-loop pairs — not a loop
+   worth porting to Rust, but the result of one-row estimates. Real
+   statistics (`ANALYZE`, above) fixed the plans.
+4. **The load did avoidable work in nanosql.** `_check_unique_constraints`
+   took 14.0 s of an 83 s load profile (with the Rust codec) and the lexer
+   24.8 s, called three times per statement. In-memory unique-key indexes
+   and a single lexer pass brought them to 0.13 s and 8.2 s.
+5. **What was left of the load was descents, parsing and AST walks.** In
+   a pure-Python SF 0.005 load profile of 88.4 s, decoding internal pages
+   on every descent took 38.7 s cumulative (183,957 decodes for 43,372
+   inserts), each `VALUES` literal walked the eight-level precedence chain
+   (9.8 s), and nanosql walked every literal looking for subqueries
+   (~4 s). A cache of decoded internal pages in the B+Tree, fast paths in
+   the parser and lexer (each compared against the previous code by
+   Hypothesis tests in `sql-query-parser`) and skipping leaf nodes in the
+   walk brought the same profile to 36.1 s.
 
-What remains on the load path is lexing and parsing 500-row `INSERT`
-statements in Python (22 s of the 54 s profiled) and the B+Tree inserts
-themselves (12 s); queries spend their time materialising MVCC snapshots
-and JSON payloads into columnar batches.
+What remains in that profile is the B+Tree inserts themselves (9.4 s in
+pure Python, 5.8 s with Rust), lexing (5.8 s, now mostly creating the
+parser's immutable `Token`/`Position` objects), MVCC reads (4.4 s /
+1.8 s), parsing (3.0 s), parameter binding (2.0 s) and `ANALYZE` (1.8 s)
+— per-row work in Python, without another single hot spot.
 
 ### Built-in micro-benchmark (`nanosql --benchmark`)
 
