@@ -35,3 +35,25 @@ jobs:
       - run: ruff check .
       - run: ruff format --check src tests
       - run: mypy --strict src/
+
+  sqllogictest:
+    # Conformidad con el corpus sqllogictest de SQLite (tests/sqllogictest):
+    # falla si algún fichero supera menos registros que results.json.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -e .
+      - name: Run the corpus and compare with the stored results
+        run: >-
+          python -m nanosql.sqllogictest tests/sqllogictest/corpus/*.test.gz
+          --timeout 60 --memory-limit-mb 6144
+          --json sqllogictest-results.json
+          --check tests/sqllogictest/results.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sqllogictest-results
+          path: sqllogictest-results.json

@@ -1,0 +1,193 @@
+{
+  "files": {
+    "evidence_in1": {
+      "bug": 0,
+      "passed": 27,
+      "percent": 20.45,
+      "resource": 0,
+      "run": 132,
+      "skipped": 84,
+      "unsupported": 105
+    },
+    "evidence_in2": {
+      "bug": 0,
+      "passed": 44,
+      "percent": 83.02,
+      "resource": 0,
+      "run": 53,
+      "skipped": 1,
+      "unsupported": 9
+    },
+    "evidence_slt_lang_aggfunc": {
+      "bug": 0,
+      "passed": 5,
+      "percent": 100.0,
+      "resource": 0,
+      "run": 5,
+      "skipped": 0,
+      "unsupported": 0
+    },
+    "evidence_slt_lang_update": {
+      "bug": 0,
+      "passed": 24,
+      "percent": 88.89,
+      "resource": 0,
+      "run": 27,
+      "skipped": 0,
+      "unsupported": 3
+    },
+    "index_between_10_slt_good_0": {
+      "bug": 0,
+      "passed": 10030,
+      "percent": 99.97,
+      "resource": 0,
+      "run": 10033,
+      "skipped": 0,
+      "unsupported": 3
+    },
+    "index_commute_10_slt_good_0": {
+      "bug": 0,
+      "passed": 10027,
+      "percent": 99.93,
+      "resource": 0,
+      "run": 10034,
+      "skipped": 0,
+      "unsupported": 7
+    },
+    "index_delete_10_slt_good_0": {
+      "bug": 0,
+      "passed": 10071,
+      "percent": 93.86,
+      "resource": 0,
+      "run": 10730,
+      "skipped": 0,
+      "unsupported": 659
+    },
+    "index_in_10_slt_good_0": {
+      "bug": 0,
+      "passed": 10032,
+      "percent": 99.97,
+      "resource": 0,
+      "run": 10035,
+      "skipped": 0,
+      "unsupported": 3
+    },
+    "index_orderby_10_slt_good_0": {
+      "bug": 0,
+      "passed": 10047,
+      "percent": 99.94,
+      "resource": 0,
+      "run": 10053,
+      "skipped": 0,
+      "unsupported": 6
+    },
+    "index_orderby_nosort_10_slt_good_0": {
+      "bug": 0,
+      "passed": 10043,
+      "percent": 99.9,
+      "resource": 0,
+      "run": 10053,
+      "skipped": 0,
+      "unsupported": 10
+    },
+    "index_random_10_slt_good_0": {
+      "bug": 0,
+      "passed": 8651,
+      "percent": 86.23,
+      "resource": 0,
+      "run": 10032,
+      "skipped": 2140,
+      "unsupported": 1381
+    },
+    "index_view_10_slt_good_1": {
+      "bug": 0,
+      "passed": 1094,
+      "percent": 15.33,
+      "resource": 0,
+      "run": 7135,
+      "skipped": 1065,
+      "unsupported": 6041
+    },
+    "random_aggregates_slt_good_0": {
+      "bug": 0,
+      "passed": 8705,
+      "percent": 86.95,
+      "resource": 0,
+      "run": 10012,
+      "skipped": 3910,
+      "unsupported": 1307
+    },
+    "random_expr_slt_good_0": {
+      "bug": 0,
+      "passed": 12,
+      "percent": 0.12,
+      "resource": 0,
+      "run": 10012,
+      "skipped": 5414,
+      "unsupported": 10000
+    },
+    "random_groupby_slt_good_0": {
+      "bug": 0,
+      "passed": 9622,
+      "percent": 96.1,
+      "resource": 0,
+      "run": 10012,
+      "skipped": 547,
+      "unsupported": 390
+    },
+    "random_select_slt_good_0": {
+      "bug": 0,
+      "passed": 9587,
+      "percent": 95.76,
+      "resource": 0,
+      "run": 10012,
+      "skipped": 1072,
+      "unsupported": 425
+    },
+    "select1": {
+      "bug": 0,
+      "passed": 239,
+      "percent": 23.18,
+      "resource": 0,
+      "run": 1031,
+      "skipped": 0,
+      "unsupported": 792
+    },
+    "select2": {
+      "bug": 0,
+      "passed": 217,
+      "percent": 21.05,
+      "resource": 0,
+      "run": 1031,
+      "skipped": 0,
+      "unsupported": 814
+    },
+    "select3": {
+      "bug": 0,
+      "passed": 723,
+      "percent": 21.58,
+      "resource": 0,
+      "run": 3351,
+      "skipped": 0,
+      "unsupported": 2628
+    },
+    "select4": {
+      "bug": 0,
+      "passed": 2856,
+      "percent": 74.05,
+      "resource": 0,
+      "run": 3857,
+      "skipped": 0,
+      "unsupported": 1001
+    },
+    "select5": {
+      "bug": 0,
+      "passed": 1436,
+      "percent": 100.0,
+      "resource": 0,
+      "run": 1436,
+      "skipped": 0,
+      "unsupported": 0
+    }
+  }
+}
